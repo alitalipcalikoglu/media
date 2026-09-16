@@ -86,6 +86,10 @@ Browser upload without proxying through your backend:
 
 Private file for a signed-in user: backend calls `POST /v1/files/:id/urls?ttl=300` and embeds `urls.medium.url` in the page.
 
+## Examples
+
+Scenario walkthroughs for every feature live in [examples/](examples/README.md).
+
 ## Configuration
 
 All settings come from environment variables and are validated at startup. See [.env.example](.env.example).
