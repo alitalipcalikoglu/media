@@ -61,3 +61,35 @@ export async function testImage({ width = 640, height = 480, format = 'jpeg', wi
 export const silentLog = /** @type {any} */ (new Proxy({}, {
   get: (_t, prop) => (prop === 'child' ? () => silentLog : () => {}),
 }));
+
+/**
+ * Fully wired MediaService on a temp directory and in-memory database.
+ * @param {Record<string, string>} [envOverrides]
+ */
+export async function testMediaService(envOverrides = {}) {
+  const { FileStore } = await import('../src/store/file-store.js');
+  const { TicketStore } = await import('../src/store/ticket-store.js');
+  const { ImageProcessor } = await import('../src/domain/image-processor.js');
+  const { MediaService } = await import('../src/domain/media-service.js');
+  const { UrlSigner } = await import('../src/url-signer.js');
+  const config = testConfig(envOverrides);
+  const { dir, cleanup } = tempDir();
+  const db = testDb();
+  const files = new FileStore(db);
+  const tickets = new TicketStore(db);
+  const storage = await testStorage(dir);
+  const clock = { now: Date.now() };
+  const service = new MediaService({
+    files, tickets, storage,
+    images: new ImageProcessor({ maxPixels: config.maxImagePixels, quality: config.variantQuality }),
+    signer: new UrlSigner(config.signingSecret),
+    log: silentLog,
+    options: {
+      publicBaseUrl: config.publicBaseUrl, maxUploadBytes: config.maxUploadBytes, allowedTypes: config.allowedTypes, variants: config.variants,
+      stripImageMetadata: config.stripImageMetadata, signedUrlTtlSec: config.signedUrlTtlSec, uploadTicketTtlSec: config.uploadTicketTtlSec,
+      deleteGraceMs: config.deleteGraceDays * 86_400_000,
+    },
+    now: () => clock.now,
+  });
+  return { service, config, db, files, tickets, storage, clock, dir, cleanup };
+}
