@@ -17,7 +17,7 @@ export class Application {
   constructor(config) {
     this.config = config;
     this.audit = new AuditClient({ target: config.audit });
-    this.db = new Database(config.dbPath);
+    this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.files = new FileStore(this.db);
     this.tickets = new TicketStore(this.db);
     this.storage = new LocalStorage(config.dataDir);

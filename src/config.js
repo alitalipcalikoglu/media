@@ -53,6 +53,7 @@ export class Config {
     this.tls = v.tls;
     this.audit = v.audit;
     this.dbPath = v.dbPath;
+    this.dbBackupDir = v.dbBackupDir;
     this.dataDir = v.dataDir;
     this.publicBaseUrl = v.publicBaseUrl;
     this.apiKeys = v.apiKeys;
@@ -101,6 +102,7 @@ export class Config {
       tls: certPath ? { certPath, keyPath } : null,
       audit: parseAudit(r),
       dbPath: r.optional('DB_PATH') || './data/media.db',
+      dbBackupDir: r.optional('DB_BACKUP_DIR') || undefined,
       dataDir: r.optional('DATA_DIR') || './data/files',
       publicBaseUrl,
       apiKeys: Config.#parseApiKeys(r.required('MEDIA_API_KEYS')),

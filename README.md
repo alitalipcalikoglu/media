@@ -155,6 +155,17 @@ logging. Does not parse or forward `traceparent`.
 
 Back up the database and the `objects`/`variants` directories from the same snapshot — restoring
 only one half produces a database row pointing at a missing file, or an orphaned file with no row.
+`stack backup`/`stack restore` from the workspace root (see `stack/docs/UPGRADE.md`) captures the
+database and both directories together for exactly this reason; a database-only backup is never a
+complete backup of this service. `tmp/` (in-flight uploads) is never included — it is safe to lose
+and is cleared on the next start anyway. On every start, before applying a pending migration to an
+existing database, the service itself also snapshots the database file to
+`DB_PATH.pre-v<N>-<timestamp>` (directory overridable with `DB_BACKUP_DIR`) — a manual last resort
+that still needs `objects`/`variants` restored alongside it.
+
+**Rollback limitations:** none of the migrations are reversible; to roll back, restore the database
+and `objects`/`variants` from the same `stack backup` snapshot (or the pre-migration database copy
+plus a same-time file copy) and run the previous version of this service against it.
 
 See [docs/READINESS.md](docs/READINESS.md) for the full contract.
 
