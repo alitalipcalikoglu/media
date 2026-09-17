@@ -1,4 +1,4 @@
-import { Config } from './config.js';
+import { Config, ConfigError } from './config.js';
 import { AuditClient } from '@atc-web/service-core/audit';
 import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Lifecycle } from '@atc-web/service-core/lifecycle';
@@ -22,7 +22,12 @@ export class Application {
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.files = new FileStore(this.db);
     this.tickets = new TicketStore(this.db);
-    this.storage = new LocalStorage(config.dataDir);
+    // Stage 8: only "local" exists — config.js already fails fast on anything else, so this
+    // switch is currently a single case, not a sign a second backend is coming.
+    switch (config.storageDriver) {
+      case 'local': this.storage = new LocalStorage(config.dataDir); break;
+      default: throw new ConfigError(`STORAGE_DRIVER "${config.storageDriver}" is not supported`);
+    }
     /** @type {import('fastify').FastifyInstance|null} */
     this.app = null;
     /** @type {Maintenance|null} */
@@ -49,12 +54,13 @@ export class Application {
     const service = new MediaService({
       files: this.files, tickets: this.tickets, storage: this.storage,
       images: new ImageProcessor({ maxPixels: config.maxImagePixels, quality: config.variantQuality }),
-      signer: new UrlSigner(config.signingSecret),
+      signer: new UrlSigner(config.signingSecret, config.signingSecretPrevious),
       log: /** @type {any} */ (console),
       options: {
         publicBaseUrl: config.publicBaseUrl, maxUploadBytes: config.maxUploadBytes, allowedTypes: config.allowedTypes, variants: config.variants,
         stripImageMetadata: config.stripImageMetadata, signedUrlTtlSec: config.signedUrlTtlSec, uploadTicketTtlSec: config.uploadTicketTtlSec,
         deleteGraceMs: config.deleteGraceDays * 86_400_000,
+        maxConcurrentVariants: config.maxConcurrentVariants, variantWaitTimeoutMs: config.variantWaitTimeoutMs,
       },
     });
     const app = await new MediaApi({ config, audit: this.audit, service, db: this.db, files: this.files, version: this.version }).build();

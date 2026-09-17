@@ -1,22 +1,29 @@
-import { createReadStream } from 'node:fs';
 import { FileName } from '../domain/file-name.js';
 import { TypeSniffer } from '../storage/type-sniffer.js';
 
 /** @typedef {import('../types.js').FileRecord} FileRecord */
+/** @typedef {import('../storage/storage.js').Storage} Storage */
+/** @typedef {import('../storage/storage.js').StorageKey} StorageKey */
 
 /**
  * Streams stored bytes with strong ETags, conditional requests, single-range support and
- * type-appropriate security headers. Immutable objects → long cache lifetimes.
+ * type-appropriate security headers. Immutable objects → long cache lifetimes. Reads bytes only
+ * through {@link Storage#open} — never touches a filesystem path itself.
  */
 export class FileServer {
   static PUBLIC_CACHE = 'public, max-age=31536000, immutable';
   static PRIVATE_CACHE = 'private, max-age=0, no-store';
 
+  /** @param {Storage} storage */
+  constructor(storage) {
+    this.storage = storage;
+  }
+
   /**
    * @param {import('fastify').FastifyRequest} request
    * @param {import('fastify').FastifyReply} reply
    * @param {FileRecord} file
-   * @param {{ path: string, mime: string, size: number }} target
+   * @param {{ key: StorageKey, mime: string, size: number }} target
    * @param {string} variant
    */
   async send(request, reply, file, target, variant) {
@@ -55,7 +62,7 @@ export class FileServer {
       reply.raw.end();
       return reply;
     }
-    return reply.send(createReadStream(target.path, { start, end }));
+    return reply.send(await this.storage.open(target.key, { start, end }));
   }
 
   /**

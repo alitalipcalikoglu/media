@@ -17,7 +17,7 @@ test('upload sniffs type, normalises images, dedupes blobs and exposes urls', as
     assert.equal(f.name, 'holiday.jpg');
     assert.deepEqual([f.width, f.height], [300, 400], 'orientation applied');
     assert.notEqual(f.size, src.length, 're-encoded');
-    const stored = readFileSync(t.storage.objectPath(f.sha256));
+    const stored = readFileSync(/** @type {string} */ (await t.storage.localPath({ kind: 'object', sha256: f.sha256 })));
     assert.equal((await sharp(stored).metadata()).exif, undefined, 'EXIF stripped from stored original');
 
     const dup = await t.service.upload(streamOf(src), { apiKeyId: 'k', visibility: 'private' });
@@ -98,9 +98,9 @@ test('variants are generated once and cached; delete, restore and purge remove b
   try {
     const f = await t.service.upload(streamOf(await testImage({ width: 800, height: 600 })), { apiKeyId: 'k', visibility: 'public' });
     const [a, b] = await Promise.all([t.service.resolve(f, 'thumb'), t.service.resolve(f, 'thumb')]);
-    assert.equal(a.path, b.path);
+    assert.deepEqual(a.key, b.key);
     assert.equal(a.mime, 'image/webp');
-    const meta = await sharp(a.path).metadata();
+    const meta = await sharp(/** @type {string} */ (await t.storage.localPath(a.key))).metadata();
     assert.deepEqual([meta.width, meta.height], [200, 200]);
     const orig = await t.service.resolve(f, 'original');
     assert.equal(orig.mime, 'image/jpeg');
@@ -117,12 +117,12 @@ test('variants are generated once and cached; delete, restore and purge remove b
     assert.equal(t.service.restore(f.id, 'k').id, f.id);
     t.service.delete(f.id, 'k');
     assert.deepEqual(await t.service.purge(), { files: 0, blobs: 0, tickets: 0 }, 'inside grace period');
-    assert.equal(await t.storage.exists(f.sha256), true);
+    assert.equal(await t.storage.exists({ kind: 'object', sha256: f.sha256 }), true);
     t.clock.now += 86_400_001;
     assert.deepEqual(await t.service.purge(), { files: 1, blobs: 1, tickets: 0 });
-    assert.equal(await t.storage.exists(f.sha256), false);
-    assert.equal(await t.storage.statPath(a.path), null, 'variants removed with the blob');
-    assert.equal(await t.storage.exists(pdf.sha256), true, 'live file untouched');
+    assert.equal(await t.storage.exists({ kind: 'object', sha256: f.sha256 }), false);
+    assert.equal(await t.storage.stat(a.key), null, 'variants removed with the blob');
+    assert.equal(await t.storage.exists({ kind: 'object', sha256: pdf.sha256 }), true, 'live file untouched');
   } finally {
     t.cleanup();
   }

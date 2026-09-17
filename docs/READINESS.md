@@ -4,9 +4,11 @@
 
 Secure binary/media storage and delivery: raw streaming uploads, real MIME sniffing, image
 normalisation with metadata stripped, sha256 content-addressed deduplication, signed URLs, browser
-upload tickets, on-demand WebP variants, soft delete with a grace period. Out of scope: an
-S3-compatible backend today (README says "add a class with the same methods"; not implemented),
-malware scanning, resumable/multipart uploads.
+upload tickets, on-demand WebP variants, soft delete with a grace period. Bytes are reached only
+through the `Storage` interface (`src/storage/storage.js`, Stage 8); `LocalStorage` is the only
+implementation. Out of scope: an S3-compatible backend today (add a class implementing `Storage`;
+not implemented — see the Stage 8 report for the real semantic gaps that would remain), malware
+scanning, resumable/multipart uploads.
 
 ## Dependencies
 
@@ -45,11 +47,21 @@ forwarder → stop maintenance → close the database → exit. Force-exit 60 s;
 checked before decoding). `max_memory_restart`: 600M (sharp decodes images in memory; the highest
 memory ceiling of any service in the platform for exactly that reason).
 
+`MAX_CONCURRENT_VARIANTS` (default 4, Stage 8): bounds CPU-heavy on-demand variant generation,
+process-wide — see README "Scaling model" for the two-layer (dedupe, then semaphore) semantics.
+Bounded wait, bounded queue (`4×` the slot count): never an unbounded backlog of waiting requests.
+
 ## Timeouts
 
 None of its own beyond Fastify/Node defaults for the streaming request/response bodies themselves;
 uploads and downloads are expected to take as long as their size and the client's connection allow,
 which is why `kill_timeout` here is the longest in the platform.
+
+`VARIANT_WAIT_TIMEOUT_MS` (default 30s, Stage 8): the one exception — bounds how long a genuinely
+new (non-deduped) variant generation waits for a free `MAX_CONCURRENT_VARIANTS` slot before
+failing `503 VARIANT_BUSY`. Does not bound the generation itself once it has a slot, and does not
+apply to a request that only deduped onto an already-running generation (nothing new to wait for a
+slot on).
 
 ## Retry policy
 
@@ -95,12 +107,22 @@ Does not parse or forward `traceparent`.
 ## Security model
 
 API keys (`id:secret`, no roles). `SIGNING_SECRET` (HMAC over file id, variant, expiry) for signed
-delivery URLs — no previous-secret grace: rotating it invalidates every outstanding signed URL
-immediately, which the README states as a known consequence, not a bug. Upload tickets: 32 random
-bytes, only their SHA-256 hash stored, single use, expire. MIME is sniffed from content (magic
-bytes), never trusted from the client's declared type; images are re-encoded (stripping EXIF and
-any other embedded metadata) rather than stored as received. Path components (sha256, variant name)
-are regex-validated before touching the filesystem — no path traversal via a crafted id.
+delivery URLs. Stage 8 adds `SIGNING_SECRET_PREVIOUS`: an optional rotation grace — verification
+accepts a signature made with `current` or `previous`, signing only ever uses `current`, and an
+unknown/tampered/expired signature still fails closed regardless of rotation state (see README
+"Rotating SIGNING_SECRET" for the operational runbook). Comparison is `timingSafeEqual`, tried
+against each configured secret in turn. Neither secret is ever logged or exposed via `/v1/info`.
+Upload tickets: 32 random bytes, only their SHA-256 hash stored, single use, expire. MIME is
+sniffed from content (magic bytes), never trusted from the client's declared type; images are
+re-encoded (stripping EXIF and any other embedded metadata) rather than stored as received.
+
+Every `Storage` key field (sha256, variant name, temp id) is validated against a strict character
+allowlist before it ever reaches a path — enforced once, inside `LocalStorage`, behind the `Storage`
+interface (Stage 8) rather than scattered across callers. A 64-hex-char sha256, a
+`[a-z][a-z0-9-]{0,31}` variant name or a v4 UUID temp id cannot contain `/`, `..` or a null byte, so
+there is no path-traversal, absolute-path or separator-injection surface to escape through; the
+abstraction did not weaken this boundary, it only relocated it (`test/storage-contract.test.js`'s
+traversal-rejection case, run against the same backend the rest of the contract suite exercises).
 
 ## Scaling model
 
@@ -123,11 +145,16 @@ second instance starting later would do to the first instance's already-in-fligh
   — the readiness path is now non-destructive (`check()`); `prepare()` only ever runs once, at
   process start.
 - Purge (`Maintenance`, deletes soft-deleted files past `DELETE_GRACE_DAYS`) racing a fresh upload
-  of the same content: the object-store bytes for an orphaned blob are removed after the database
-  row is deleted in the same transaction; a very tight race with a concurrent upload of identical
-  content within that window is a known, narrow edge case, not yet closed (see
-  `stack/docs/ARCHITECTURE_AUDIT.md` §3, media row, for the proposed fix — out of scope for this
-  stage).
+  of the same content: `FileStore#purge`'s DB transaction deletes the orphan blob *row* first;
+  `MediaService#purge` then removes the object-store *bytes* afterward, outside that transaction.
+  A very tight race — a fresh upload of the exact same content lands in that window, between the
+  row being deleted and the bytes actually being unlinked — is a known, narrow, still-open gap at
+  the cross-service (DB ↔ storage) level: not fixed in this or any prior stage, despite the
+  storage layer's own behavior around it being real and tested (Stage 8:
+  `test/storage-contract.test.js`'s purge/upload race test proves `Storage#remove`/`#commit`
+  never corrupt or throw under this exact interleaving — they just don't, by themselves, know
+  which of the two racing DB-level decisions *should* win). See the Stage 8 report for the full
+  analysis; still out of scope to actually close here.
 - Disk full mid-upload: the write fails, the temp file is not moved into place, the client sees an
   error; no partial object is left in `objects/`.
 - Two instances sharing one `dataDir`: unsupported, see above — avoid.

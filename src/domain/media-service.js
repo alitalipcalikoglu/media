@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
+import { buffer as streamToBuffer } from 'node:stream/consumers';
+import { UploadError } from '../storage/storage.js';
 import { TypeSniffer } from '../storage/type-sniffer.js';
-import { UploadError } from '../storage/local-storage.js';
 import { MediaError } from './errors.js';
 import { FileName } from './file-name.js';
+import { Semaphore, SemaphoreQueueFullError, SemaphoreTimeoutError } from './semaphore.js';
 
 /** @typedef {import('../types.js').FileRecord} FileRecord */
 /** @typedef {import('../types.js').Visibility} Visibility */
@@ -10,7 +12,8 @@ import { FileName } from './file-name.js';
 /** @typedef {import('../types.js').Logger} Logger */
 /** @typedef {import('../store/file-store.js').FileStore} FileStore */
 /** @typedef {import('../store/ticket-store.js').TicketStore} TicketStore */
-/** @typedef {import('../storage/local-storage.js').LocalStorage} LocalStorage */
+/** @typedef {import('../storage/storage.js').Storage} Storage */
+/** @typedef {import('../storage/storage.js').StorageKey} StorageKey */
 /** @typedef {import('./image-processor.js').ImageProcessor} ImageProcessor */
 /** @typedef {import('../url-signer.js').UrlSigner} UrlSigner */
 
@@ -33,18 +36,23 @@ import { FileName } from './file-name.js';
  * @property {number} signedUrlTtlSec
  * @property {number} uploadTicketTtlSec
  * @property {number} deleteGraceMs
+ * @property {number} maxConcurrentVariants   Active CPU-bound variant generations allowed at once, process-wide.
+ * @property {number} variantWaitTimeoutMs    Bound on how long a NEW (non-deduped) generation waits for a free slot.
  */
 
 /**
  * All media use-cases: upload (direct or by ticket), metadata, visibility, deletion with grace
- * period, variant generation, URL building and signed-URL authorisation.
+ * period, variant generation, URL building and signed-URL authorisation. Talks to bytes only
+ * through {@link Storage} — never `node:fs`, `node:path`, or a local filesystem path (the one
+ * documented exception being the CPU-bound image decode below, via `Storage#localPath`'s
+ * explicit, nullable escape hatch, with a buffering fallback when it is null).
  */
 export class MediaService {
   /**
    * @param {object} deps
    * @param {FileStore} deps.files
    * @param {TicketStore} deps.tickets
-   * @param {LocalStorage} deps.storage
+   * @param {Storage} deps.storage
    * @param {ImageProcessor} deps.images
    * @param {UrlSigner} deps.signer
    * @param {Logger} deps.log
@@ -62,8 +70,15 @@ export class MediaService {
     this.now = now;
     /** @type {Map<string, VariantSpec>} */
     this.variants = new Map(options.variants.map((v) => [v.name, v]));
-    /** Variant generations in flight, keyed by path, so concurrent requests share one encode. @type {Map<string, Promise<void>>} */
+    // Two layers, applied in this order (Stage 8): (1) `inflight` — a concurrent request for the
+    // SAME (object, variant) shares one generation, no matter how many callers ask; it never
+    // touches the semaphore at all. (2) `semaphore` — only genuinely distinct generations (a new
+    // object, or a variant nobody is currently making) contend for `maxConcurrentVariants` CPU
+    // slots. This is why 20 concurrent requests for one (object, variant) cost exactly one slot,
+    // not 20: the 19 followers never reach the semaphore, they just await the same promise.
+    /** @type {Map<string, Promise<void>>} */
     this.inflight = new Map();
+    this.semaphore = new Semaphore(options.maxConcurrentVariants);
   }
 
   // ---------------------------------------------------------------- upload
@@ -80,12 +95,12 @@ export class MediaService {
     const allowed = o.allowedTypes ? o.allowedTypes.filter((t) => this.options.allowedTypes.includes(t)) : this.options.allowedTypes;
     let received;
     try {
-      received = await this.storage.receive(stream, { maxBytes });
+      received = await this.storage.writeTemp(stream, { maxBytes });
     } catch (err) {
       if (err instanceof UploadError) throw new MediaError(err.code, err.message, { maxBytes });
       throw err;
     }
-    let { tmpPath, sha256, size } = received;
+    let { key: tempKey, sha256, size } = received;
     try {
       const mime = TypeSniffer.sniff(received.head);
       if (!mime || !allowed.includes(mime)) {
@@ -94,22 +109,23 @@ export class MediaService {
       /** @type {number|null} */ let width = null;
       /** @type {number|null} */ let height = null;
       if (TypeSniffer.isRasterImage(mime)) {
-        const info = await this.images.inspect(tmpPath);
+        const input = await this.#readInput(tempKey);
+        const info = await this.images.inspect(input);
         width = info.width;
         height = info.height;
         if (this.options.stripImageMetadata) {
-          const normalized = await this.images.normalize(tmpPath, mime);
-          const cleanPath = `${tmpPath}.clean`;
-          await this.storage.writeAtomic(cleanPath, normalized.buffer);
-          await this.storage.discard(tmpPath);
-          tmpPath = cleanPath;
+          const normalized = await this.images.normalize(input, mime);
+          const cleanKey = this.storage.tempKey();
+          await this.storage.writeAtomic(cleanKey, normalized.buffer);
+          await this.storage.discard(tempKey);
+          tempKey = cleanKey;
           sha256 = createHash('sha256').update(normalized.buffer).digest('hex');
           size = normalized.buffer.length;
           width = normalized.width;
           height = normalized.height;
         }
       }
-      await this.storage.commit(tmpPath, sha256);
+      await this.storage.commit(tempKey, { kind: 'object', sha256 });
       const record = this.files.createFile({
         apiKeyId: o.apiKeyId,
         blob: { sha256, size, mime, width, height },
@@ -119,7 +135,7 @@ export class MediaService {
       this.log.info({ fileId: record.id, sha256, mime, size, apiKeyId: o.apiKeyId }, 'file stored');
       return record;
     } catch (err) {
-      await this.storage.discard(tmpPath);
+      await this.storage.discard(tempKey);
       throw err;
     }
   }
@@ -232,43 +248,96 @@ export class MediaService {
   // ---------------------------------------------------------------- delivery
 
   /**
-   * Path and type of the bytes to serve for a variant, generating it on first request.
+   * Storage key and type of the bytes to serve for a variant, generating it on first request.
    * @param {FileRecord} f
    * @param {string} variant "original" or a preset name.
-   * @returns {Promise<{ path: string, mime: string, size: number }>}
+   * @param {{ signal?: AbortSignal }} [o] `signal`: this ONE caller's own abort (e.g. its HTTP
+   *   client disconnected) — stops THIS call from waiting any longer and lets it return control
+   *   to its caller, but never cancels the underlying generation itself: `#generate`'s promise is
+   *   shared by every concurrent request for the same (object, variant) (see below), so one
+   *   caller giving up must never fail the others still waiting on the same result, and the
+   *   generation is left to finish and populate the cache regardless.
+   * @returns {Promise<{ key: StorageKey, mime: string, size: number }>}
    */
-  async resolve(f, variant) {
-    if (variant === 'original') return { path: this.storage.objectPath(f.sha256), mime: f.mime, size: f.size };
+  async resolve(f, variant, { signal } = {}) {
+    if (variant === 'original') return { key: { kind: 'object', sha256: f.sha256 }, mime: f.mime, size: f.size };
     const spec = this.variants.get(variant);
     if (!spec) throw new MediaError('UNKNOWN_VARIANT', `unknown variant "${variant}"`);
     if (!TypeSniffer.isRasterImage(f.mime)) throw new MediaError('NOT_AN_IMAGE', 'variants exist for images only');
-    const path = this.storage.variantPath(f.sha256, variant);
-    let st = await this.storage.statPath(path);
+    /** @type {StorageKey} */
+    const key = { kind: 'variant', sha256: f.sha256, name: variant };
+    let st = await this.storage.stat(key);
     if (!st) {
-      await this.#generate(f, spec, path);
-      st = await this.storage.statPath(path);
+      await MediaService.#abortable(this.#generate(f, spec, key), signal);
+      st = await this.storage.stat(key);
       if (!st) throw new Error('variant vanished after generation');
     }
-    return { path, mime: 'image/webp', size: st.size };
+    return { key, mime: 'image/webp', size: st.size };
   }
 
   /**
    * @param {FileRecord} f
    * @param {VariantSpec} spec
-   * @param {string} path
+   * @param {import('../storage/storage.js').VariantKey} key
    */
-  #generate(f, spec, path) {
-    let p = this.inflight.get(path);
-    if (!p) {
-      p = (async () => {
+  #generate(f, spec, key) {
+    const cacheKey = `${key.sha256}:${key.name}`;
+    let p = this.inflight.get(cacheKey);
+    if (p) return p; // Layer 1 (dedupe): share the one generation already in flight; no semaphore wait at all.
+    p = (async () => {
+      // Layer 2 (bounded concurrency): only a genuinely new generation reaches here. Bounded by
+      // `variantWaitTimeoutMs` only — NOT by any individual caller's signal, since this promise
+      // may be shared by several callers (see `resolve`'s doc); one of them disconnecting must
+      // not abandon a wait the others are still relying on.
+      const release = await this.semaphore.acquire({ timeoutMs: this.options.variantWaitTimeoutMs }).catch((err) => {
+        throw err instanceof SemaphoreTimeoutError || err instanceof SemaphoreQueueFullError
+          ? new MediaError('VARIANT_BUSY', 'too many variants are being generated right now; try again shortly')
+          : err;
+      });
+      try {
         const started = Date.now();
-        const buffer = await this.images.variant(this.storage.objectPath(f.sha256), spec);
-        await this.storage.writeAtomic(path, buffer);
+        const input = await this.#readInput({ kind: 'object', sha256: f.sha256 });
+        const buffer = await this.images.variant(input, spec);
+        await this.storage.writeAtomic(key, buffer);
         this.log.info({ sha256: f.sha256, variant: spec.name, bytes: buffer.length, durationMs: Date.now() - started }, 'variant generated');
-      })().finally(() => this.inflight.delete(path));
-      this.inflight.set(path, p);
-    }
+      } finally {
+        release();
+      }
+    })().finally(() => this.inflight.delete(cacheKey));
+    this.inflight.set(cacheKey, p);
     return p;
+  }
+
+  /**
+   * Race `promise` against `signal` without affecting `promise` itself — used so ONE caller's
+   * abort only stops that caller's own wait, never a generation or semaphore wait shared with
+   * others.
+   * @param {Promise<void>} promise
+   * @param {AbortSignal|undefined} signal
+   */
+  static #abortable(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    });
+  }
+
+  /**
+   * Bytes for `key` as whatever `ImageProcessor` (sharp) can decode most efficiently: a real
+   * local path when the backend has one (`Storage#localPath` — always true for `LocalStorage`),
+   * or the fully-buffered content otherwise. This is the one place `MediaService` ever sees
+   * something path-shaped, and it is never retained, logged or passed anywhere except straight
+   * into `sharp`.
+   * @param {StorageKey|import('../storage/storage.js').TempKey} key
+   * @returns {Promise<string|Buffer>}
+   */
+  async #readInput(key) {
+    const localPath = await this.storage.localPath(key);
+    if (localPath !== null) return localPath;
+    return streamToBuffer(await this.storage.open(key));
   }
 
   /**
@@ -316,7 +385,7 @@ export class MediaService {
   async purge() {
     const now = this.now();
     const { files, orphanBlobs } = this.files.purge(now - this.options.deleteGraceMs);
-    for (const sha of orphanBlobs) await this.storage.remove(sha);
+    for (const sha256 of orphanBlobs) await this.storage.remove({ kind: 'object', sha256 });
     const tickets = this.tickets.purge(now);
     return { files, blobs: orphanBlobs.length, tickets };
   }

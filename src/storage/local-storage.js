@@ -1,41 +1,43 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
-import { mkdir, rename, rm, stat, unlink } from 'node:fs/promises';
+import { createReadStream, createWriteStream } from 'node:fs';
+import { link, mkdir, rename, rm, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
+import { Storage, UploadError } from './storage.js';
 import { TypeSniffer } from './type-sniffer.js';
 
-export class UploadError extends Error {
-  /**
-   * @param {'TOO_LARGE'|'EMPTY'|'STREAM_ERROR'} code
-   * @param {string} message
-   */
-  constructor(code, message) {
-    super(message);
-    this.name = 'UploadError';
-    this.code = code;
-  }
-}
+export { UploadError };
+
+/** @typedef {import('./storage.js').StorageKey} StorageKey */
+/** @typedef {import('./storage.js').TempKey} TempKey */
+/** @typedef {import('./storage.js').Received} Received */
+
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const VARIANT_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+const TEMP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * @typedef {object} Received
- * @property {string} tmpPath
- * @property {string} sha256
- * @property {number} size
- * @property {Buffer} head   First bytes, for type sniffing.
- */
-
-/**
- * Content-addressed object storage on the local file system.
+ * Content-addressed object storage on the local file system, behind the {@link Storage}
+ * contract — see there for the operations and their semantics. On-disk layout (an implementation
+ * detail no caller outside this file depends on):
  *
- *   <dataDir>/tmp/<uuid>                incoming uploads
+ *   <dataDir>/tmp/<uuid>                incoming uploads and scratch content
  *   <dataDir>/objects/ab/cd/<sha256>    immutable originals
- *   <dataDir>/variants/<sha256>/<name>  derived images
+ *   <dataDir>/variants/<sha256>/<name>.webp   derived images
+ *
+ * Every key field (`sha256`, variant `name`, temp `id`) is validated against a strict allowlist
+ * before it ever reaches a path — the same boundary the pre-abstraction version enforced, just
+ * relocated behind {@link Storage}'s key types instead of raw strings. A 64-hex-character sha256,
+ * a `[a-z][a-z0-9-]{0,31}` variant name or a v4-shaped UUID cannot contain `/`, `..` or a `\0`, so
+ * there is no path-traversal, absolute-path or separator-injection surface to escape through —
+ * `#assertKey` rejects anything else before any `fs` call is ever reached.
+ * @extends {Storage}
  */
-export class LocalStorage {
+export class LocalStorage extends Storage {
   /** @param {string} dataDir */
   constructor(dataDir) {
+    super();
     this.dataDir = dataDir;
   }
 
@@ -59,36 +61,19 @@ export class LocalStorage {
     return this;
   }
 
-  /** @param {string} sha256 */
-  objectPath(sha256) {
-    LocalStorage.#assertSha(sha256);
-    return join(this.dataDir, 'objects', sha256.slice(0, 2), sha256.slice(2, 4), sha256);
-  }
-
-  /** @param {string} sha256 */
-  variantDir(sha256) {
-    LocalStorage.#assertSha(sha256);
-    return join(this.dataDir, 'variants', sha256);
+  /** @returns {TempKey} */
+  tempKey() {
+    return { kind: 'temp', id: randomUUID() };
   }
 
   /**
-   * @param {string} sha256
-   * @param {string} name Preset name, already validated against configuration.
-   */
-  variantPath(sha256, name) {
-    if (!/^[a-z][a-z0-9-]{0,31}$/.test(name)) throw new Error('invalid variant name');
-    return join(this.variantDir(sha256), `${name}.webp`);
-  }
-
-  /**
-   * Stream an upload to a temp file while hashing, counting and capturing the head.
-   * Rejects with {@link UploadError} and removes the temp file when the limit is exceeded.
    * @param {NodeJS.ReadableStream} source
    * @param {{ maxBytes: number }} o
    * @returns {Promise<Received>}
    */
-  async receive(source, { maxBytes }) {
-    const tmpPath = join(this.dataDir, 'tmp', randomUUID());
+  async writeTemp(source, { maxBytes }) {
+    const key = this.tempKey();
+    const tmpPath = this.#path(key);
     const hash = createHash('sha256');
     let size = 0;
     /** @type {Buffer[]} */
@@ -117,65 +102,106 @@ export class LocalStorage {
       await unlink(tmpPath).catch(() => {});
       throw new UploadError('EMPTY', 'upload is empty');
     }
-    return { tmpPath, sha256: hash.digest('hex'), size, head: Buffer.concat(headChunks).subarray(0, TypeSniffer.HEAD_BYTES) };
+    return { key, sha256: hash.digest('hex'), size, head: Buffer.concat(headChunks).subarray(0, TypeSniffer.HEAD_BYTES) };
   }
 
   /**
-   * Move a temp file into place as the object for `sha256`. If the object already exists the
-   * temp file is discarded (content-addressed dedupe).
-   * @param {string} tmpPath
-   * @param {string} sha256
-   * @returns {Promise<boolean>} true when a new object was stored.
+   * `link()`, not `exists()`-then-`rename()`: `rename()` onto an existing destination silently
+   * replaces it on POSIX, so two commits of the same key racing each other could both "succeed"
+   * and both report `true` — the exact same-content-dedup safety the interface promises would be
+   * unsound under real concurrency. `link()` atomically fails with `EEXIST` when the destination
+   * is already there (same guarantee as `open(O_CREAT|O_EXCL)`), so of any number of concurrent
+   * commits of the same key, the kernel guarantees exactly one link succeeds.
+   * @param {TempKey} tempKey
+   * @param {StorageKey} key
+   * @returns {Promise<boolean>}
    */
-  async commit(tmpPath, sha256) {
-    const dest = this.objectPath(sha256);
-    if (await this.exists(sha256)) {
-      await unlink(tmpPath);
+  async commit(tempKey, key) {
+    const dest = this.#path(key);
+    const src = this.#path(tempKey);
+    await mkdir(dirname(dest), { recursive: true });
+    try {
+      await link(src, dest);
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'EEXIST') throw err;
+      await unlink(src).catch(() => {});
       return false;
     }
-    await mkdir(dirname(dest), { recursive: true });
-    await rename(tmpPath, dest);
+    await unlink(src);
     return true;
   }
 
   /**
-   * Write a file atomically (temp + rename) at `path` inside the data dir.
-   * @param {string} path
+   * @param {StorageKey|TempKey} key
    * @param {Buffer} data
    */
-  async writeAtomic(path, data) {
-    const tmp = join(this.dataDir, 'tmp', randomUUID());
-    await mkdir(dirname(path), { recursive: true });
+  async writeAtomic(key, data) {
+    const dest = this.#path(key);
+    const tmp = this.#path(this.tempKey());
+    await mkdir(dirname(dest), { recursive: true });
     await pipeline([data], createWriteStream(tmp, { flags: 'wx', mode: 0o600 }));
-    await rename(tmp, path);
+    await rename(tmp, dest);
   }
 
-  /** @param {string} path */
-  async discard(path) {
-    await unlink(path).catch(() => {});
-  }
-
-  /** @param {string} sha256 */
-  async exists(sha256) {
-    return stat(this.objectPath(sha256)).then((s) => s.isFile(), () => false);
+  /** @param {StorageKey} key */
+  async exists(key) {
+    return stat(this.#path(key)).then((s) => s.isFile(), () => false);
   }
 
   /**
-   * @param {string} path
-   * @returns {Promise<import('node:fs').Stats|null>}
+   * @param {StorageKey|TempKey} key
+   * @param {{ start?: number, end?: number }} [range]
+   * @returns {Promise<NodeJS.ReadableStream>}
    */
-  async statPath(path) {
-    return stat(path).catch(() => null);
+  async open(key, range = {}) {
+    return createReadStream(this.#path(key), range);
   }
 
-  /** Remove an object and every derived variant. @param {string} sha256 */
-  async remove(sha256) {
-    await unlink(this.objectPath(sha256)).catch(() => {});
-    await rm(this.variantDir(sha256), { recursive: true, force: true });
+  /** @param {StorageKey} key */
+  async stat(key) {
+    const s = await stat(this.#path(key)).catch(() => null);
+    return s ? { size: s.size } : null;
+  }
+
+  /**
+   * LocalStorage always has one — this is the one backend where the escape hatch documented on
+   * {@link Storage#localPath} is always taken.
+   * @param {StorageKey|TempKey} key
+   */
+  async localPath(key) {
+    return this.#path(key);
+  }
+
+  /** Remove an object and every derived variant, or a single variant. @param {StorageKey} key */
+  async remove(key) {
+    await unlink(this.#path(key)).catch(() => {});
+    if (key.kind === 'object') await rm(this.#variantDir(key.sha256), { recursive: true, force: true });
+  }
+
+  /** @param {TempKey} key */
+  async discard(key) {
+    await unlink(this.#path(key)).catch(() => {});
+  }
+
+  /**
+   * Maps a validated {@link StorageKey}/{@link TempKey} to its on-disk path. The only place a
+   * filesystem path is ever constructed — every field is checked against its allowlist first.
+   * @param {StorageKey|TempKey} key
+   */
+  #path(key) {
+    if (key.kind === 'temp') {
+      if (!TEMP_ID_RE.test(key.id)) throw new Error('invalid temp key');
+      return join(this.dataDir, 'tmp', key.id);
+    }
+    if (!SHA256_RE.test(key.sha256)) throw new Error('invalid sha256');
+    if (key.kind === 'object') return join(this.dataDir, 'objects', key.sha256.slice(0, 2), key.sha256.slice(2, 4), key.sha256);
+    if (!VARIANT_NAME_RE.test(key.name)) throw new Error('invalid variant name');
+    return join(this.#variantDir(key.sha256), `${key.name}.webp`);
   }
 
   /** @param {string} sha256 */
-  static #assertSha(sha256) {
-    if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error('invalid sha256');
+  #variantDir(sha256) {
+    if (!SHA256_RE.test(sha256)) throw new Error('invalid sha256');
+    return join(this.dataDir, 'variants', sha256);
   }
 }

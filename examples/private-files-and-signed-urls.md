@@ -51,4 +51,19 @@ Public → private takes effect immediately for new requests; content already ca
 
 ## Rotating the secret
 
-`SIGNING_SECRET` change + restart invalidates every outstanding signed URL. Clients call `POST /v1/files/:id/urls` again; nothing else is affected.
+A bare `SIGNING_SECRET` change + restart invalidates every outstanding signed URL immediately —
+fine if that's acceptable, but Stage 8 adds a grace period for when it isn't:
+
+```bash
+# 1. K1 is SIGNING_SECRET today.
+# 2. Deploy with the new secret current and the old one previous:
+SIGNING_SECRET=K2
+SIGNING_SECRET_PREVIOUS=K1
+# New URLs are signed with K2 only; verification still accepts K1 (never used to sign new URLs).
+# 3. Wait out the longest TTL any URL signed under K1 could still have (SIGNED_URL_TTL_SEC, or the
+#    longest custom `ttl` passed to POST /v1/files/:id/urls — 7 days max).
+# 4. Deploy again with SIGNING_SECRET_PREVIOUS removed. K1 URLs now fail (fail closed); K2 keeps working.
+```
+
+`SIGNING_SECRET_PREVIOUS` is only meant to be set for that grace window — see README "Rotating
+SIGNING_SECRET" for the full runbook.

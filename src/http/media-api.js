@@ -60,7 +60,7 @@ export class MediaApi {
     this.version = version;
     this.auth = new ApiKeyAuth(config.apiKeys);
     this.cors = new Cors(config.corsOrigins);
-    this.fileServer = new FileServer();
+    this.fileServer = new FileServer(service.storage);
     this.counters = { uploads: 0, downloads: 0, bytesOut: 0 };
   }
 
@@ -149,7 +149,11 @@ export class MediaApi {
       const query = /** @type {{ exp?: string, sig?: string, download?: string }} */ (request.query);
       const file = this.service.get(id);
       if (!this.service.authorize(file, variant, query)) throw new MediaError('FORBIDDEN', 'missing or invalid signature');
-      const target = await this.service.resolve(file, variant);
+      // Best-effort: stop waiting for a variant slot if the client already went away — never
+      // cancels a generation other callers still depend on (see MediaService#resolve).
+      const abort = new AbortController();
+      request.raw.on('close', () => abort.abort());
+      const target = await this.service.resolve(file, variant, { signal: abort.signal });
       if (query.download === '1') reply.header('x-media-force-download', '1');
       this.counters.downloads += 1;
       this.counters.bytesOut += target.size;

@@ -59,6 +59,10 @@ export class Config {
     this.apiKeys = v.apiKeys;
     this.rateLimitMax = v.rateLimitMax;
     this.signingSecret = v.signingSecret;
+    this.signingSecretPrevious = v.signingSecretPrevious;
+    this.storageDriver = v.storageDriver;
+    this.maxConcurrentVariants = v.maxConcurrentVariants;
+    this.variantWaitTimeoutMs = v.variantWaitTimeoutMs;
     this.maxUploadBytes = v.maxUploadBytes;
     this.maxImagePixels = v.maxImagePixels;
     this.allowedTypes = v.allowedTypes;
@@ -87,6 +91,18 @@ export class Config {
 
     const signingSecret = r.required('SIGNING_SECRET');
     if (signingSecret.length < Config.MIN_SECRET_LENGTH) throw new ConfigError(`SIGNING_SECRET must be at least ${Config.MIN_SECRET_LENGTH} characters`);
+    const signingSecretPrevious = r.optional('SIGNING_SECRET_PREVIOUS') || undefined;
+    if (signingSecretPrevious !== undefined && signingSecretPrevious.length < Config.MIN_SECRET_LENGTH) {
+      throw new ConfigError(`SIGNING_SECRET_PREVIOUS must be at least ${Config.MIN_SECRET_LENGTH} characters`);
+    }
+    if (signingSecretPrevious !== undefined && signingSecretPrevious === signingSecret) {
+      throw new ConfigError('SIGNING_SECRET_PREVIOUS must not be the same as SIGNING_SECRET');
+    }
+
+    // Stage 8: the only backend today. Fail fast on anything else rather than silently ignoring
+    // an operator's typo — see Application#start for where this actually selects a Storage.
+    const storageDriver = r.optional('STORAGE_DRIVER') || 'local';
+    if (storageDriver !== 'local') throw new ConfigError(`STORAGE_DRIVER "${storageDriver}" is not supported; only "local" exists today`);
 
     const allowedTypes = r.list('ALLOWED_TYPES', Config.DEFAULT_TYPES).map((t) => t.toLowerCase());
     for (const t of allowedTypes) if (!Config.KNOWN_TYPES.has(t)) throw new ConfigError(`ALLOWED_TYPES contains unsupported type "${t}"`);
@@ -108,6 +124,10 @@ export class Config {
       apiKeys: Config.#parseApiKeys(r.required('MEDIA_API_KEYS')),
       rateLimitMax: r.integer('RATE_LIMIT_MAX', 600, { min: 1 }),
       signingSecret,
+      signingSecretPrevious,
+      storageDriver,
+      maxConcurrentVariants: r.integer('MAX_CONCURRENT_VARIANTS', 4, { min: 1, max: 64 }),
+      variantWaitTimeoutMs: r.integer('VARIANT_WAIT_TIMEOUT_MS', 30_000, { min: 1_000, max: 300_000 }),
       maxUploadBytes: r.integer('MAX_UPLOAD_BYTES', 25 * 1024 * 1024, { min: 1024 }),
       maxImagePixels: r.integer('MAX_IMAGE_PIXELS', 50_000_000, { min: 10_000 }),
       allowedTypes,

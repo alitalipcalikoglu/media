@@ -11,7 +11,7 @@ test('Maintenance runs purge, coalesces concurrent runs and stops cleanly', asyn
     t.clock.now += 1;
     const m = new Maintenance({ service: t.service, log: silentLog });
     await Promise.all([m.run(), m.run()]);
-    assert.equal(await t.storage.exists(f.sha256), false);
+    assert.equal(await t.storage.exists({ kind: 'object', sha256: f.sha256 }), false);
     m.start();
     await m.stop();
   } finally {

@@ -44,7 +44,7 @@ export class ImageProcessor {
   /**
    * Re-encode in the same format with orientation applied and all metadata (EXIF, GPS, XMP, ICC
    * kept) dropped. Also defeats polyglot files: the output is a clean encoder product.
-   * @param {string} inputPath
+   * @param {string|Buffer} inputPath
    * @param {string} mime
    * @returns {Promise<{ buffer: Buffer, width: number, height: number }>}
    */
@@ -70,7 +70,7 @@ export class ImageProcessor {
 
   /**
    * Resize to a preset and encode as WebP without metadata. Never enlarges.
-   * @param {string} inputPath
+   * @param {string|Buffer} inputPath
    * @param {VariantSpec} spec
    * @returns {Promise<Buffer>}
    */

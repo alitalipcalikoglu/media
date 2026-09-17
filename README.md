@@ -104,7 +104,32 @@ All settings come from environment variables and are validated at startup. See [
 
 Required: `MEDIA_API_KEYS`, `PUBLIC_BASE_URL`, `SIGNING_SECRET`. `PUBLIC_BASE_URL` is the origin clients use to reach this service; every URL the API returns starts with it.
 
-Rotating `SIGNING_SECRET` invalidates outstanding signed URLs; issue new ones with `POST /v1/files/:id/urls`.
+- `STORAGE_DRIVER` (default `local`) — which `Storage` backend to use. `local` (`LocalStorage`) is the only value that exists today; anything else fails startup immediately with a `ConfigError`, never a silent fallback. See "Code layout" for the `Storage` interface itself.
+- `MAX_CONCURRENT_VARIANTS` (default `4`) and `VARIANT_WAIT_TIMEOUT_MS` (default `30000`) — bound CPU-heavy on-demand variant generation; see "Scaling model" below for the exact semantics.
+
+### Rotating `SIGNING_SECRET`
+
+Signed URLs are self-contained (the expiry is part of the signed data) — rotating the secret with
+nothing else in place invalidates every outstanding signed URL immediately, which breaks any
+client that cached one. `SIGNING_SECRET_PREVIOUS` gives a grace period instead:
+
+1. `K1` is `SIGNING_SECRET` today; nothing else configured.
+2. Deploy with `SIGNING_SECRET=K2` (new) and `SIGNING_SECRET_PREVIOUS=K1` (old). From this moment:
+   every *new* URL is signed with `K2` only; verification accepts a signature made with either
+   `K2` or `K1` — `K1` is never used to sign anything new, only to keep validating URLs already
+   handed out.
+3. Wait out the grace period: the longest TTL any URL signed under `K1` could still have
+   (`SIGNED_URL_TTL_SEC`, or a longer custom `ttl` passed to `POST /v1/files/:id/urls` — 7 days
+   max). Any `K1` URL older than that has already expired on its own.
+4. Deploy again with `SIGNING_SECRET_PREVIOUS` removed. `K1` URLs now fail verification (fail
+   closed, same as an unrecognised secret); `K2` keeps working. `SIGNING_SECRET_PREVIOUS` is not
+   meant to be kept indefinitely — it exists for exactly this window.
+
+Neither secret is ever logged or exposed via `/v1/info` or any other endpoint. If a backup or an
+old `.env` gets restored with a stale `SIGNING_SECRET`/`SIGNING_SECRET_PREVIOUS` pair, matching
+that pair up with whatever URLs were actually issued under it is the operator's own
+responsibility — the service has no way to know which secret was live when a given signed URL
+still in the wild was generated.
 
 ## Security notes
 
@@ -128,9 +153,11 @@ Class-based; dependencies are injected through constructors, `src/application.js
 | `Config`, `VariantPreset` | `src/config.js` | Validated environment, preset parsing |
 | `Database` | `src/db.js` | SQLite connection, migrations, transactions |
 | `FileStore`, `TicketStore` | `src/store/` | Blobs, files, upload tickets |
-| `LocalStorage`, `TypeSniffer` | `src/storage/` | Content-addressed objects, hashed streaming receive, magic bytes |
+| `Storage` | `src/storage/storage.js` | The storage contract (Stage 8) — `prepare`/`check`/`tempKey`/`writeTemp`/`commit`/`writeAtomic`/`exists`/`open`/`stat`/`localPath`/`remove`/`discard` — everything `MediaService` depends on; a filesystem path never crosses it except through the explicit, nullable `localPath` escape hatch |
+| `LocalStorage`, `TypeSniffer` | `src/storage/` | The only `Storage` implementation today; content-addressed objects, hashed streaming receive, magic bytes |
 | `ImageProcessor` | `src/domain/image-processor.js` | Inspect, normalise, variants (sharp) |
-| `MediaService` | `src/domain/media-service.js` | All use-cases |
+| `MediaService` | `src/domain/media-service.js` | All use-cases; talks to bytes only through `Storage` |
+| `Semaphore` | `src/domain/semaphore.js` | Bounded concurrency gate behind `MAX_CONCURRENT_VARIANTS` |
 | `FileName`, `MediaError` | `src/domain/` | Safe names, error codes |
 | `UrlSigner` | `src/url-signer.js` | HMAC signed URLs |
 | `MediaApi`, `FileServer`, `Cors`, `ApiKeyAuth`, `Schemas` | `src/http/` | Routes, delivery, browser access |
@@ -138,7 +165,7 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 ## Out of scope by design
 
-- Object storage backends (S3, GCS): `LocalStorage` is the only backend. Add a class with the same methods when a deployment needs remote storage.
+- Object storage backends (S3, GCS): `LocalStorage` is the only `Storage` implementation. A future backend implements the same interface (`src/storage/storage.js`) — see its "Stage 8 report" note on the real semantic gaps a remote backend would still have to close (no atomic rename equivalent, streaming/`localPath` fallback cost, consistency model) before assuming a drop-in replacement is trivial.
 - Video and audio: not in `ALLOWED_TYPES`; transcoding is a different service.
 - Arbitrary resize parameters in URLs: only configured presets, so nobody can make the server encode 10 000 sizes.
 - Multiple processes on one data directory: intended deployment is one instance per data directory.
@@ -153,6 +180,20 @@ Single-node stateful: one process owns the SQLite file and the local object-stor
 Deferred variant generation de-duplicates concurrent requests for the same variant only within one
 process — two instances asked for the same missing variant would both encode it (wasted work, not
 corruption). Two instances sharing one data directory are not supported.
+
+**Variant generation concurrency (Stage 8).** Two layers, always in this order:
+1. **Dedupe** — every concurrent request for the exact same `(object, variant)` shares one
+   in-flight generation; N callers cost exactly one CPU-bound encode, never N.
+2. **`MAX_CONCURRENT_VARIANTS`** (default 4) — only genuinely distinct generations (a different
+   object, or a variant nobody is currently making) contend for this many process-wide slots. A
+   new one that finds every slot taken waits, bounded by `VARIANT_WAIT_TIMEOUT_MS` (default 30s)
+   and by a bounded wait queue (`4×` the slot count) — past either bound it fails with `503
+   VARIANT_BUSY` rather than queueing forever. A waiting HTTP request whose client disconnects
+   stops waiting immediately (best-effort — see `MediaService#resolve`'s doc for why this can never
+   cancel a generation shared with another still-connected caller). A failed generation (thrown
+   error, or a storage write failure) always releases its slot and never leaves a cached failure
+   behind — the next request retries from scratch, and a partial/corrupt variant is never visible
+   under its final key (write is atomic).
 
 ## Observability
 

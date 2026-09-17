@@ -13,6 +13,7 @@ export class MediaError extends Error {
     TOO_LARGE: 413,
     UNSUPPORTED_TYPE: 415,
     INVALID_IMAGE: 422,
+    VARIANT_BUSY: 503,
   };
 
   /**

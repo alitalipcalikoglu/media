@@ -29,6 +29,10 @@
  * @property {ApiKey[]} apiKeys
  * @property {number} rateLimitMax
  * @property {string} signingSecret
+ * @property {string} [signingSecretPrevious]  Accepted for verification only during a rotation grace period; never used to sign.
+ * @property {'local'} storageDriver
+ * @property {number} maxConcurrentVariants   Bounded CPU-heavy variant generations at once, process-wide.
+ * @property {number} variantWaitTimeoutMs    Bound on how long a new (non-deduped) generation waits for a free slot.
  * @property {number} maxUploadBytes
  * @property {number} maxImagePixels
  * @property {string[]} allowedTypes

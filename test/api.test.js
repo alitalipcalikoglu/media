@@ -47,11 +47,11 @@ test('GET /v1/info reports service identity and current capabilities', async () 
 
 test('/ready never disturbs an upload that is still streaming into tmp', async () => {
   const { streamOf } = await import('./helpers.js');
-  const receiving = t.service.storage.receive(streamOf(Buffer.from('in-flight upload bytes')), { maxBytes: 1_000_000 });
+  const receiving = t.service.storage.writeTemp(streamOf(Buffer.from('in-flight upload bytes')), { maxBytes: 1_000_000 });
   assert.equal((await app.inject('/ready')).statusCode, 200, 'first poll (may run storage.check())');
   assert.equal((await app.inject('/ready')).statusCode, 200);
   const received = await receiving;
-  assert.equal(await t.service.storage.commit(received.tmpPath, received.sha256), true, 'the upload that was in flight during /ready still commits');
+  assert.equal(await t.service.storage.commit(received.key, { kind: 'object', sha256: received.sha256 }), true, 'the upload that was in flight during /ready still commits');
 });
 
 test('PUT /v1/files stores a raw body, GET/PATCH/DELETE/restore manage it', async () => {
