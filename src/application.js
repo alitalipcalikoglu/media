@@ -1,4 +1,5 @@
 import { Config } from './config.js';
+import { AuditClient } from './net/audit-client.js';
 import { Database } from './db.js';
 import { ImageProcessor } from './domain/image-processor.js';
 import { MediaService } from './domain/media-service.js';
@@ -14,6 +15,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath);
     this.files = new FileStore(this.db);
     this.tickets = new TicketStore(this.db);
@@ -51,11 +53,13 @@ export class Application {
         deleteGraceMs: config.deleteGraceDays * 86_400_000,
       },
     });
-    const app = await new MediaApi({ config, service, db: this.db, files: this.files }).build();
+    const app = await new MediaApi({ config, audit: this.audit, service, db: this.db, files: this.files }).build();
     this.app = app;
     service.log = app.log.child({ component: 'media' });
     this.maintenance = new Maintenance({ service, log: app.log.child({ component: 'maintenance' }) });
     this.#installSignalHandlers(app.log);
+    this.audit.logger = app.log;
+    this.audit.start();
     await app.listen({ port: config.port, host: config.host });
     app.log.info({ tls: config.tls !== null, dataDir: config.dataDir, variants: config.variants.map((v) => v.name) }, config.tls ? 'serving HTTPS' : 'serving plain HTTP, terminate TLS at a reverse proxy');
     this.maintenance.start();
@@ -74,6 +78,7 @@ export class Application {
     }, 60_000).unref();
     try {
       await this.app?.close();
+      await this.audit.close();
       await this.maintenance?.stop();
       this.db.close();
       clearTimeout(forceExit);

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
+import { AuditClient } from '../net/audit-client.js';
 import { MediaError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Cors } from './cors.js';
@@ -45,9 +46,11 @@ export class MediaApi {
    * @param {import('../db.js').Database} deps.db
    * @param {import('../store/file-store.js').FileStore} deps.files
    * @param {import('../types.js').Logger} [deps.logger]
+   * @param {import('../net/audit-client.js').AuditClient} [deps.audit]
    */
-  constructor({ config, service, db, files, logger }) {
+  constructor({ config, audit, service, db, files, logger }) {
     this.config = config;
+    this.audit = audit;
     this.service = service;
     this.db = db;
     this.files = files;
@@ -76,6 +79,7 @@ export class MediaApi {
     app.addContentTypeParser('*', (_request, payload, done) => done(null, payload));
     app.decorateRequest('apiKeyId', '');
     app.setErrorHandler(this.#errorHandler);
+    app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
@@ -204,7 +208,7 @@ export class MediaApi {
     });
     const s = this.service;
 
-    api.put('/files', { schema: { querystring: Schemas.uploadQuery } }, async (request, reply) => {
+    api.put('/files', { config: { audit: AuditClient.route('media.file.upload', (_r, b) => ({ type: 'file', id: b.file.id }), (_r, b) => ({ name: b?.file?.name, visibility: b?.file?.visibility })) },  schema: { querystring: Schemas.uploadQuery } }, async (request, reply) => {
       const q = /** @type {{ visibility?: 'public'|'private', name?: string }} */ (request.query);
       const f = await s.upload(/** @type {NodeJS.ReadableStream} */ (request.raw), { apiKeyId: request.apiKeyId, visibility: q.visibility, name: q.name ?? MediaApi.#fileName(request) });
       this.counters.uploads += 1;
@@ -225,16 +229,16 @@ export class MediaApi {
       file: this.#view(s.get(/** @type {{ id: string }} */ (request.params).id, request.apiKeyId)),
     }));
 
-    api.patch('/files/:id', { schema: { params: Schemas.idParams, body: Schemas.patchBody } }, async (request) => ({
+    api.patch('/files/:id', { config: { audit: AuditClient.route('media.file.update', (r) => ({ type: 'file', id: /** @type {any} */ (r.params).id }), (r) => ({ patch: r.body })) },  schema: { params: Schemas.idParams, body: Schemas.patchBody } }, async (request) => ({
       file: this.#view(s.update(/** @type {{ id: string }} */ (request.params).id, request.apiKeyId, /** @type {any} */ (request.body))),
     }));
 
-    api.delete('/files/:id', { schema: { params: Schemas.idParams } }, async (request, reply) => {
+    api.delete('/files/:id', { config: { audit: AuditClient.route('media.file.delete', (r) => ({ type: 'file', id: /** @type {any} */ (r.params).id })) },  schema: { params: Schemas.idParams } }, async (request, reply) => {
       s.delete(/** @type {{ id: string }} */ (request.params).id, request.apiKeyId);
       return reply.code(204).send();
     });
 
-    api.post('/files/:id/restore', { schema: { params: Schemas.idParams } }, async (request) => ({
+    api.post('/files/:id/restore', { config: { audit: AuditClient.route('media.file.restore', (r) => ({ type: 'file', id: /** @type {any} */ (r.params).id })) },  schema: { params: Schemas.idParams } }, async (request) => ({
       file: this.#view(s.restore(/** @type {{ id: string }} */ (request.params).id, request.apiKeyId)),
     }));
 
@@ -245,7 +249,7 @@ export class MediaApi {
       return { urls: s.urls(f, ttl) };
     });
 
-    api.post('/uploads', { schema: { body: Schemas.ticketBody } }, async (request, reply) => {
+    api.post('/uploads', { config: { audit: AuditClient.route('media.upload.ticket', (_r, b) => ({ type: 'ticket', id: b.token })) },  schema: { body: Schemas.ticketBody } }, async (request, reply) => {
       const body = /** @type {any} */ (request.body ?? {});
       const t = s.createTicket({ apiKeyId: request.apiKeyId, ...body });
       return reply.code(201).send({ ...t, expiresAt: new Date(t.expiresAt).toISOString(), method: 'PUT' });
