@@ -139,6 +139,25 @@ Class-based; dependencies are injected through constructors, `src/application.js
 
 With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwarded to the audit service as one event (`success`, or `denied` on 403) with the calling key as actor, the affected entity as target, client IP, user agent and request id. Events are buffered and sent in batches; the audit service being down never fails a request. Actions: see [examples/audit-events.md](examples/audit-events.md).
 
+## Scaling model
+
+Single-node stateful: one process owns the SQLite file and the local object-storage directory.
+Deferred variant generation de-duplicates concurrent requests for the same variant only within one
+process — two instances asked for the same missing variant would both encode it (wasted work, not
+corruption). Two instances sharing one data directory are not supported.
+
+## Observability
+
+Accepts an inbound `X-Request-Id` unconditionally and logs it via Fastify's default request
+logging. Does not parse or forward `traceparent`.
+
+## Backup / restore
+
+Back up the database and the `objects`/`variants` directories from the same snapshot — restoring
+only one half produces a database row pointing at a missing file, or an orphaned file with no row.
+
+See [docs/READINESS.md](docs/READINESS.md) for the full contract.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
