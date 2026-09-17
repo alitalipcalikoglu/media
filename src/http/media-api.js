@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, registerProbes } from '@atc-web/service-core/fastify';
+import { createErrorHandler, registerInfo, registerProbes } from '@atc-web/service-core/fastify';
 import { MediaError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Cors } from './cors.js';
@@ -48,14 +48,16 @@ export class MediaApi {
    * @param {import('../store/file-store.js').FileStore} deps.files
    * @param {import('../types.js').Logger} [deps.logger]
    * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
+   * @param {string} deps.version
    */
-  constructor({ config, audit, service, db, files, logger }) {
+  constructor({ config, audit, service, db, files, logger, version }) {
     this.config = config;
     this.audit = audit;
     this.service = service;
     this.db = db;
     this.files = files;
     this.logger = logger;
+    this.version = version;
     this.auth = new ApiKeyAuth(config.apiKeys);
     this.cors = new Cors(config.corsOrigins);
     this.fileServer = new FileServer();
@@ -93,6 +95,12 @@ export class MediaApi {
       this.db.ping();
       await this.service.storage.check();
     }, { cacheMs: MediaApi.READY_CACHE_MS });
+    registerInfo(app, {
+      service: 'media',
+      version: this.version,
+      capabilities: ['content-dedup', 'signed-urls', 'ticketed-uploads', 'soft-delete', 'variants'],
+      schemaVersion: this.db.schemaVersion,
+    });
     this.#registerDelivery(app);
     this.#registerTicketUpload(app);
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });

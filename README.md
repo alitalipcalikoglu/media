@@ -44,6 +44,14 @@ npm run typecheck
 - **Variants** are presets from `VARIANTS` (`thumb:200x200:cover`, `medium:800`, …), generated on first request, cached on disk, served as WebP, never enlarged.
 - **Visibility.** `public` files have stable URLs with immutable caching. `private` files need `exp` and `sig` query parameters; signatures are bound to file id, variant and expiry.
 
+## Boundaries
+
+**Purpose:** content-addressed file storage, ticketed uploads, and signed delivery.
+
+**Responsibilities:** dedup by sha256; ticketed browser uploads; public/private visibility; signed, time-limited delivery URLs; variant generation; soft delete/restore; purge.
+
+**Non-responsibilities:** media ≠ CDN/object-store implementation — today's `LocalStorage` is disk-only, single-node; the `Storage` interface (a later stage) is a seam for a future backend, not a claim that one exists. It is not a general blob store for other services' internal files — everything goes through this same public, ticketed/signed API, never a shared disk path.
+
 ## API
 
 Errors are JSON: `{ "error": { "code", "message", "details?" } }`.

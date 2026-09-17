@@ -1,5 +1,6 @@
 import { Config } from './config.js';
 import { AuditClient } from '@atc-web/service-core/audit';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { Lifecycle } from '@atc-web/service-core/lifecycle';
 import { Database } from './db.js';
 import { ImageProcessor } from './domain/image-processor.js';
@@ -16,6 +17,7 @@ export class Application {
   /** @param {Config} config */
   constructor(config) {
     this.config = config;
+    this.version = readServiceVersion(import.meta.url);
     this.audit = new AuditClient({ target: config.audit });
     this.db = new Database(config.dbPath, { backupDir: config.dbBackupDir });
     this.files = new FileStore(this.db);
@@ -55,7 +57,7 @@ export class Application {
         deleteGraceMs: config.deleteGraceDays * 86_400_000,
       },
     });
-    const app = await new MediaApi({ config, audit: this.audit, service, db: this.db, files: this.files }).build();
+    const app = await new MediaApi({ config, audit: this.audit, service, db: this.db, files: this.files, version: this.version }).build();
     this.app = app;
     service.log = app.log.child({ component: 'media' });
     this.maintenance = new Maintenance({ service, log: app.log.child({ component: 'maintenance' }) });

@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import sharp from 'sharp';
+import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { MediaApi } from '../src/http/media-api.js';
 import { API_KEY, OTHER_KEY, silentLog, testImage, testMediaService } from './helpers.js';
+
+const VERSION = readServiceVersion(import.meta.url);
 
 /** @type {Awaited<ReturnType<typeof testMediaService>>} */
 let t;
@@ -15,7 +18,7 @@ const call = (method, url, { payload, headers = {} } = {}) => app.inject({ metho
 
 before(async () => {
   t = await testMediaService({ CORS_ORIGINS: 'https://app.test.local', RATE_LIMIT_MAX: '500' });
-  app = await new MediaApi({ config: t.config, service: t.service, db: t.db, files: t.files, logger: silentLog }).build();
+  app = await new MediaApi({ config: t.config, service: t.service, db: t.db, files: t.files, logger: silentLog, version: VERSION }).build();
   await app.ready();
 });
 after(async () => { await app.close(); t.cleanup(); });
@@ -28,6 +31,18 @@ test('probes are public; /v1 and /metrics need an API key', async () => {
     assert.equal(res.statusCode, 401, url);
   }
   assert.equal((await app.inject({ url: '/nope', headers: auth })).statusCode, 404);
+});
+
+test('GET /v1/info reports service identity and current capabilities', async () => {
+  const res = await app.inject('/v1/info');
+  assert.equal(res.statusCode, 200);
+  const body = res.json();
+  assert.equal(body.service, 'media');
+  assert.equal(body.version, VERSION);
+  assert.equal(body.apiVersion, 'v1');
+  assert.deepEqual(body.capabilities, ['content-dedup', 'signed-urls', 'ticketed-uploads', 'soft-delete', 'variants']);
+  assert.equal(typeof body.schemaVersion, 'number');
+  assert.equal(typeof body.serviceCore, 'string');
 });
 
 test('/ready never disturbs an upload that is still streaming into tmp', async () => {
