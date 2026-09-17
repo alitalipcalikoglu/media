@@ -152,7 +152,7 @@ Class-based; dependencies are injected through constructors, `src/application.js
 | `Application` | `src/application.js` | Wiring, startup, graceful shutdown |
 | `Config`, `VariantPreset` | `src/config.js` | Validated environment, preset parsing |
 | `Database` | `src/db.js` | SQLite connection, migrations, transactions |
-| `FileStore`, `TicketStore` | `src/store/` | Blobs, files, upload tickets |
+| `FileStore`, `TicketStore` | `src/store/` | Blobs, files, upload tickets; `FileStore`'s two-phase mark/finalize purge protocol (Stage 8.1) closes the purge-vs-concurrent-upload race — see `docs/READINESS.md` |
 | `Storage` | `src/storage/storage.js` | The storage contract (Stage 8) — `prepare`/`check`/`tempKey`/`writeTemp`/`commit`/`writeAtomic`/`exists`/`open`/`stat`/`localPath`/`remove`/`discard` — everything `MediaService` depends on; a filesystem path never crosses it except through the explicit, nullable `localPath` escape hatch |
 | `LocalStorage`, `TypeSniffer` | `src/storage/` | The only `Storage` implementation today; content-addressed objects, hashed streaming receive, magic bytes |
 | `ImageProcessor` | `src/domain/image-processor.js` | Inspect, normalise, variants (sharp) |

@@ -84,7 +84,11 @@ export class Storage {
 
   /**
    * Move a temp entry into place under its permanent key. If that key already holds content
-   * (content-addressed dedup), the temp entry is discarded instead.
+   * (content-addressed dedup), `tempKey` is left untouched rather than discarded — a caller that
+   * needs to know may re-`commit()` from the same temp entry again later (e.g. `MediaService`'s
+   * purge-race self-heal: the "already there" content it deduped against may have been removed by
+   * a stale purge in between, and `commit()` is safe to retry, being atomic). Either way, the
+   * caller owns `discard(tempKey)` once it's genuinely done with it.
    * @param {TempKey} tempKey
    * @param {StorageKey} key
    * @returns {Promise<boolean>} true when new content was stored, false when deduped.

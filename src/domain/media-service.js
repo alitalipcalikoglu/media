@@ -48,6 +48,9 @@ import { Semaphore, SemaphoreQueueFullError, SemaphoreTimeoutError } from './sem
  * explicit, nullable escape hatch, with a buffering fallback when it is null).
  */
 export class MediaService {
+  /** Bound on upload's post-commit self-heal retries (Stage 8.1) — never an unbounded loop. */
+  static SELF_HEAL_ATTEMPTS = 3;
+
   /**
    * @param {object} deps
    * @param {FileStore} deps.files
@@ -125,13 +128,35 @@ export class MediaService {
           height = normalized.height;
         }
       }
-      await this.storage.commit(tempKey, { kind: 'object', sha256 });
+      /** @type {import('../storage/storage.js').ObjectKey} */
+      const key = { kind: 'object', sha256 };
+      const stored = await this.storage.commit(tempKey, key);
       const record = this.files.createFile({
         apiKeyId: o.apiKeyId,
         blob: { sha256, size, mime, width, height },
         name: FileName.sanitize(o.name, mime),
         visibility: o.visibility ?? 'private',
       }, this.now());
+      // Stage 8.1: `stored === true` means we just linked these bytes ourselves — commit() already
+      // consumed tempKey, and there is no pre-existing blob row a concurrent purge could have been
+      // mid-way through reclaiming (see docs/READINESS.md "Purge/upload race" for why that's sound).
+      // `stored === false` (deduped: the object already existed) is the one case a stale purge
+      // could have removed those bytes in the narrow window between our dedup check and our
+      // `createFile` row landing — self-heal: confirm, and if the bytes are genuinely gone,
+      // `commit()` again from our own still-held tempKey. `commit()` is atomic (`link`+`EEXIST`),
+      // so re-invoking it can never race unsafely with another concurrent committer; bounded to a
+      // few attempts purely as defensive insurance, never an unbounded retry loop.
+      if (!stored) {
+        let healed = await this.storage.exists(key);
+        for (let attempt = 0; !healed && attempt < MediaService.SELF_HEAL_ATTEMPTS; attempt++) {
+          await this.storage.commit(tempKey, key);
+          healed = await this.storage.exists(key);
+        }
+        if (!healed) {
+          throw new Error(`object ${sha256} missing after ${MediaService.SELF_HEAL_ATTEMPTS} self-heal attempts — this should be structurally impossible; a concurrent purge would have to win this exact race repeatedly`);
+        }
+      }
+      await this.storage.discard(tempKey);
       this.log.info({ fileId: record.id, sha256, mime, size, apiKeyId: o.apiKeyId }, 'file stored');
       return record;
     } catch (err) {
@@ -380,13 +405,37 @@ export class MediaService {
 
   /**
    * Hard-delete files past the grace period, drop orphaned blobs and their bytes, expire tickets.
+   *
+   * Stage 8.1 blob/byte cleanup protocol (see docs/READINESS.md "Purge/upload race" for the full
+   * analysis) — three separate steps, deliberately not one transaction, so a concurrent upload's
+   * DB write has a real chance to land in between:
+   * 1. `markOrphanBlobs()` — mark every currently-orphaned, not-already-marked blob row.
+   * 2. `finalizeOrphanBlobs()` — compare-and-swap delete: a row is only actually deleted if its
+   *    mark is still exactly what was just set (or set by an earlier, crashed pass) — a
+   *    concurrent upload referencing that content again in the meantime already cleared it
+   *    (`FileStore#createFile`'s blob upsert), and that row survives instead.
+   * 3. Physically remove bytes ONLY for rows step 2 actually deleted — by that point the row is
+   *    gone for good, so nothing can "un-delete" it; a concurrent fresh upload of the same content
+   *    starts a brand new row and, via its own post-commit self-heal (`upload`'s doc), guarantees
+   *    its own bytes regardless of what this removal does.
    * @returns {Promise<{ files: number, blobs: number, tickets: number }>}
    */
   async purge() {
     const now = this.now();
-    const { files, orphanBlobs } = this.files.purge(now - this.options.deleteGraceMs);
-    for (const sha256 of orphanBlobs) await this.storage.remove({ kind: 'object', sha256 });
+    const files = this.files.purgeExpiredFiles(now - this.options.deleteGraceMs);
+    this.files.markOrphanBlobs();
+    const confirmed = this.files.finalizeOrphanBlobs();
+    for (const sha256 of confirmed) {
+      try {
+        await this.storage.remove({ kind: 'object', sha256 });
+      } catch (err) {
+        // The DB row is already gone — permanently, correctly — regardless of whether this
+        // succeeds. A failure here leaks orphan bytes on disk (no live reference exists, accepted
+        // per docs/READINESS.md); it must never abort cleanup of the other confirmed blobs.
+        this.log.error({ err, sha256 }, 'failed to remove purged blob bytes; DB row already deleted, bytes may need manual cleanup');
+      }
+    }
     const tickets = this.tickets.purge(now);
-    return { files, blobs: orphanBlobs.length, tickets };
+    return { files, blobs: confirmed.length, tickets };
   }
 }

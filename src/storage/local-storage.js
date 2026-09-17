@@ -112,6 +112,13 @@ export class LocalStorage extends Storage {
    * unsound under real concurrency. `link()` atomically fails with `EEXIST` when the destination
    * is already there (same guarantee as `open(O_CREAT|O_EXCL)`), so of any number of concurrent
    * commits of the same key, the kernel guarantees exactly one link succeeds.
+   *
+   * Stage 8.1: on the dedup (`false`) path, `tempKey` is deliberately left untouched instead of
+   * being auto-discarded — the caller (`MediaService`) may need to `commit()` again from the same
+   * temp copy if it discovers the object it deduped against was concurrently removed by a stale
+   * purge (see docs/READINESS.md "Purge/upload race"). The caller owns `discard(tempKey)` once
+   * it's actually done with it, on every path (this is why `MediaService.upload`'s `catch` always
+   * discards, unconditionally).
    * @param {TempKey} tempKey
    * @param {StorageKey} key
    * @returns {Promise<boolean>}
@@ -124,7 +131,6 @@ export class LocalStorage extends Storage {
       await link(src, dest);
     } catch (err) {
       if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'EEXIST') throw err;
-      await unlink(src).catch(() => {});
       return false;
     }
     await unlink(src);

@@ -144,17 +144,60 @@ second instance starting later would do to the first instance's already-in-fligh
 - `/ready` (or any prior version of it) triggering `prepare()`'s destructive wipe: fixed in Stage 0
   — the readiness path is now non-destructive (`check()`); `prepare()` only ever runs once, at
   process start.
-- Purge (`Maintenance`, deletes soft-deleted files past `DELETE_GRACE_DAYS`) racing a fresh upload
-  of the same content: `FileStore#purge`'s DB transaction deletes the orphan blob *row* first;
-  `MediaService#purge` then removes the object-store *bytes* afterward, outside that transaction.
-  A very tight race — a fresh upload of the exact same content lands in that window, between the
-  row being deleted and the bytes actually being unlinked — is a known, narrow, still-open gap at
-  the cross-service (DB ↔ storage) level: not fixed in this or any prior stage, despite the
-  storage layer's own behavior around it being real and tested (Stage 8:
-  `test/storage-contract.test.js`'s purge/upload race test proves `Storage#remove`/`#commit`
-  never corrupt or throw under this exact interleaving — they just don't, by themselves, know
-  which of the two racing DB-level decisions *should* win). See the Stage 8 report for the full
-  analysis; still out of scope to actually close here.
+- **Purge racing a fresh upload of the same content: closed (Stage 8.1).** Previously an open, P0
+  gap (planned but never actually implemented back at Stage 0) — a fresh upload of content whose
+  blob row purge had just deleted, landing in the narrow window before the bytes were physically
+  removed, could leave a live file referencing bytes that no longer existed. See "Purge/upload
+  race protocol" below for the closed design and its guarantee.
+
+## Purge/upload race protocol (Stage 8.1)
+
+**Guarantee**: for every committed live file row, its referenced content-addressed object is
+readable after every completed upload/purge operation, regardless of how the two interleave.
+Enforced entirely through SQLite (compare-and-swap on a per-blob token), never a process-local
+lock — correct even if maintenance and HTTP upload run in separate processes (not today's
+supported topology, see "Single-node / multi-node guarantees" above, but the protocol doesn't
+assume otherwise).
+
+Blob deletion is two-phase, `FileStore#markOrphanBlobs()` then `FileStore#finalizeOrphanBlobs()`,
+run as two separate, un-batched statements (deliberately not one transaction) so a concurrent
+upload's own transaction has a real chance to land in between:
+
+1. **Mark**: every blob row with no live file referencing it, and not already marked, gets a fresh
+   `delete_token`. Nothing is deleted yet.
+2. **Reclaim** (a concurrent upload, any time before finalize): `FileStore#createFile`'s blob
+   upsert is `INSERT … ON CONFLICT (sha256) DO UPDATE SET delete_token = NULL` — touching a blob
+   row for any reason, marked or not, always clears its token. This is the entire mechanism: an
+   upload doesn't need to know purge is running at all.
+3. **Finalize**: for every still-orphaned, currently-marked row (from this pass or an earlier one
+   that crashed before finalizing), `DELETE … WHERE sha256 = ? AND delete_token = ?` — the
+   compare-and-swap. A token cleared by a reclaim between mark and finalize makes this match zero
+   rows: the row, and therefore the bytes, survive. Only a row this DELETE actually removed is
+   safe to physically remove — by that point nothing can "un-delete" it; a fresh upload of the
+   same content afterward starts an entirely new row.
+4. **Physical removal**, per confirmed sha256, after finalize — never before. A failure here
+   (`storage.remove()` throwing) is caught per item, logged, and never aborts the rest of the
+   batch or re-throws out of `purge()`: the DB row is already gone for good either way.
+
+**Upload-side self-heal** closes the one remaining gap the two-phase delete alone can't: if
+`storage.commit()` deduped (the content already existed) but a stale purge finalized-and-removed
+those exact bytes in the narrow window before `createFile()`'s row lands, `MediaService.upload`
+re-checks `storage.exists()` after its DB write and, if the object is genuinely gone, `commit()`s
+again from its own still-held temp copy (bounded to `MediaService.SELF_HEAL_ATTEMPTS`, never an
+unbounded retry). `commit()`'s `link()`-based atomicity (Stage 8) makes this safe to retry.
+
+**Crash semantics**: a crash after mark but before finalize leaves the mark in place — the next
+maintenance pass's finalize (not just this one) re-scans and picks it up, no special recovery
+step needed. A crash after finalize (row deleted) but before the physical unlink leaks the bytes
+on disk permanently in this build (no live reference exists, so this is disk bloat, not a
+correctness violation) — accepted, matches the project's existing "orphan bytes may remain, a
+future stage may add a disk-vs-DB reconciliation sweep" stance. A live DB reference to
+permanently-missing bytes is what's actually forbidden, and no crash window produces it.
+
+Test coverage: `test/purge-race.test.js` (real `MediaService` + real SQLite + real `LocalStorage`,
+the exact interleaving from the original bug report, both crash windows, `storage.remove()`
+throwing, idempotent re-maintenance, and that an unrelated purge never touches a live file's
+object or its cached variants).
 - Disk full mid-upload: the write fails, the temp file is not moved into place, the client sees an
   error; no partial object is left in `objects/`.
 - Two instances sharing one `dataDir`: unsupported, see above — avoid.

@@ -40,5 +40,17 @@ export class Database extends CoreDatabase {
     );
     CREATE INDEX upload_tickets_expiry ON upload_tickets (expires_at);
     `,
+    `
+    -- Stage 8.1: closes the purge-vs-concurrent-upload-of-the-same-content race (P0, see
+    -- IMPLEMENTATION_PLAN.md Stage 0 — planned there, never actually implemented). A blob row is
+    -- never deleted outright the moment it's found orphaned; it's first marked with a token
+    -- (two-phase: mark, then a later/separate finalize re-confirms via compare-and-swap on this
+    -- same token before the row — and only then the bytes — are actually removed). Any upload
+    -- that references this sha256 again before finalize runs clears the token back to NULL
+    -- (FileStore#createFile's blob upsert), which finalize's CAS then detects as "reclaimed,"
+    -- skipping deletion. See docs/READINESS.md "Purge/upload race" for the full protocol.
+    ALTER TABLE blobs ADD COLUMN delete_token TEXT;
+    CREATE INDEX blobs_delete_token ON blobs (delete_token) WHERE delete_token IS NOT NULL;
+    `,
   ];
 }

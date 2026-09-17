@@ -53,7 +53,9 @@ test('LocalStorage writeTemp receives, hashes, limits and commits into a sharded
   const again = await storage.writeTemp(streamOf(data), { maxBytes: data.length });
   assert.equal(again.sha256, r.sha256);
   assert.equal(await storage.commit(again.key, key), false, 'deduped');
-  assert.equal(readdirSync(join(dir, 's1', 'tmp')).length, 0, 'temp files cleaned');
+  assert.equal(readdirSync(join(dir, 's1', 'tmp')).length, 1, 'Stage 8.1: a deduped temp is left for the caller, not auto-cleaned');
+  await storage.discard(again.key);
+  assert.equal(readdirSync(join(dir, 's1', 'tmp')).length, 0, 'temp files cleaned once the caller discards');
 
   await assert.rejects(storage.writeTemp(streamOf(data), { maxBytes: data.length - 1 }), (e) => e instanceof UploadError && e.code === 'TOO_LARGE');
   await assert.rejects(storage.writeTemp(streamOf(Buffer.alloc(0)), { maxBytes: 10 }), (e) => e instanceof UploadError && e.code === 'EMPTY');
@@ -68,6 +70,21 @@ test('LocalStorage writeTemp receives, hashes, limits and commits into a sharded
   await storage.remove(key);
   assert.equal(await storage.exists(key), false);
   assert.equal(await storage.stat({ kind: 'variant', sha256: r.sha256, name: 'thumb' }), null, 'variant dir removed with the object');
+});
+
+test('LocalStorage: concurrent same-SHA commit leaves zero files behind in tmp/ once both sides discard (Stage 8.1)', async () => {
+  const storage = await testStorage(join(dir, 's1b'));
+  const data = Buffer.from('same content, two uploads racing, checking tmp/ afterward');
+  const [a, b] = await Promise.all([storage.writeTemp(streamOf(data), { maxBytes: 1_000 }), storage.writeTemp(streamOf(data), { maxBytes: 1_000 })]);
+  const key = { kind: /** @type {const} */ ('object'), sha256: a.sha256 };
+  const [wonA, wonB] = await Promise.all([storage.commit(a.key, key), storage.commit(b.key, key)]);
+  assert.equal(Number(wonA) + Number(wonB), 1);
+  // The winner's temp is already gone (consumed by link()+unlink() inside commit()); the loser's
+  // is real content still sitting in tmp/ until whoever called commit() discards it — this is the
+  // caller's job, not something a correctness fix should ever leave undone.
+  await storage.discard(a.key);
+  await storage.discard(b.key);
+  assert.equal(readdirSync(join(dir, 's1b', 'tmp')).length, 0, 'no leftover temp file from either side of the race');
 });
 
 test('LocalStorage.prepare clears interrupted uploads from tmp', async () => {

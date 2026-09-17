@@ -60,12 +60,16 @@ function contract(name, makeBackend) {
       const first = await storage.writeTemp(streamOf(data), { maxBytes: 1_000 });
       const key = { kind: /** @type {const} */ ('object'), sha256: first.sha256 };
       assert.equal(await storage.commit(first.key, key), true);
+      await assert.rejects(streamToBuffer(await storage.open(first.key)), 'the winning temp entry is consumed (moved) by commit()');
       const second = await storage.writeTemp(streamOf(data), { maxBytes: 1_000 });
       assert.equal(second.sha256, first.sha256);
       assert.equal(await storage.commit(second.key, key), false, 'deduped, not a new object');
-      // Neither temp entry is left behind, committed or not.
-      await assert.rejects(streamToBuffer(await storage.open(first.key)));
-      await assert.rejects(streamToBuffer(await storage.open(second.key)));
+      // Stage 8.1: a DEDUPED temp entry is deliberately left alone by commit() — the caller may
+      // still need it (e.g. to retry commit() if the object it deduped against turns out to have
+      // been concurrently removed) — it's the caller's job to discard() once truly done with it.
+      assert.equal((await streamToBuffer(await storage.open(second.key))).toString(), data.toString(), 'a deduped temp entry survives commit() until the caller discards it');
+      await storage.discard(second.key);
+      await assert.rejects(streamToBuffer(await storage.open(second.key)), 'discard() actually removes it');
     } finally { cleanup(); }
   });
 
@@ -134,7 +138,7 @@ function contract(name, makeBackend) {
     } finally { cleanup(); }
   });
 
-  test(`${name}: concurrent commit of the same object from two temp sources — exactly one wins, neither throws, both temp entries are consumed`, async () => {
+  test(`${name}: concurrent commit of the same object from two temp sources — exactly one wins, neither throws, both temp entries end up discardable with nothing leaked`, async () => {
     const { storage, cleanup } = makeBackend();
     try {
       await storage.prepare();
@@ -144,6 +148,12 @@ function contract(name, makeBackend) {
       const [wonA, wonB] = await Promise.all([storage.commit(a.key, key), storage.commit(b.key, key)]);
       assert.equal(Number(wonA) + Number(wonB), 1, 'exactly one commit stores the object, the other dedupes');
       assert.equal((await streamToBuffer(await storage.open(key))).toString(), data.toString());
+      // The winner's temp key was already consumed by commit() itself; the loser's (Stage 8.1: a
+      // deduped temp is left alone, not auto-discarded) is still the caller's to clean up.
+      await storage.discard(a.key);
+      await storage.discard(b.key);
+      await assert.rejects(streamToBuffer(await storage.open(a.key)));
+      await assert.rejects(streamToBuffer(await storage.open(b.key)));
     } finally { cleanup(); }
   });
 

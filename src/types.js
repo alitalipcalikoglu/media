@@ -58,6 +58,7 @@
  * @property {number|null} width
  * @property {number|null} height
  * @property {number} created_at
+ * @property {string|null} [delete_token]  Stage 8.1: set while a purge pass has provisionally marked this blob orphaned; NULL when live or once finalized/reclaimed.
  */
 
 /**
