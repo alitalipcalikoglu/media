@@ -10,12 +10,14 @@ import { TypeSniffer } from './type-sniffer.js';
 export { UploadError };
 
 /** @typedef {import('./storage.js').StorageKey} StorageKey */
+/** @typedef {import('./storage.js').ObjectKey} ObjectKey */
 /** @typedef {import('./storage.js').TempKey} TempKey */
 /** @typedef {import('./storage.js').Received} Received */
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const VARIANT_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const TEMP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * Content-addressed object storage on the local file system, behind the {@link Storage}
@@ -46,7 +48,7 @@ export class LocalStorage extends Storage {
    * once at process start, never from a readiness probe: it deletes in-flight upload files.
    */
   async prepare() {
-    await Promise.all(['tmp', 'objects', 'variants'].map((d) => mkdir(join(this.dataDir, d), { recursive: true })));
+    await Promise.all(['tmp', 'objects', 'variants', 'trash'].map((d) => mkdir(join(this.dataDir, d), { recursive: true })));
     await rm(join(this.dataDir, 'tmp'), { recursive: true, force: true });
     await mkdir(join(this.dataDir, 'tmp'), { recursive: true });
     return this;
@@ -57,7 +59,7 @@ export class LocalStorage extends Storage {
    * call on every `/ready` poll; never touches `tmp` contents.
    */
   async check() {
-    await Promise.all(['tmp', 'objects', 'variants'].map((d) => mkdir(join(this.dataDir, d), { recursive: true })));
+    await Promise.all(['tmp', 'objects', 'variants', 'trash'].map((d) => mkdir(join(this.dataDir, d), { recursive: true })));
     return this;
   }
 
@@ -187,6 +189,47 @@ export class LocalStorage extends Storage {
   /** @param {TempKey} key */
   async discard(key) {
     await unlink(this.#path(key)).catch(() => {});
+  }
+
+  /**
+   * Single atomic `rename()` per target (object, variant directory) into a token-scoped trash
+   * path — never a copy, never a delete-then-recreate, so there is no instant where the canonical
+   * path is "half gone". Each target's `rename` is independent: an `ENOENT` (nothing there for
+   * that target) is swallowed, anything else propagates.
+   * @param {ObjectKey} key
+   * @param {string} token
+   * @returns {Promise<boolean>}
+   */
+  async detachForDelete(key, token) {
+    if (!TOKEN_RE.test(token)) throw new Error('invalid token');
+    const [object, variants] = await Promise.all([
+      rename(this.#path(key), this.#trashPath(token, 'object')).then(() => true, (err) => {
+        if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'ENOENT') throw err;
+        return false;
+      }),
+      rename(this.#variantDir(key.sha256), this.#trashPath(token, 'variants')).then(() => true, (err) => {
+        if (/** @type {NodeJS.ErrnoException} */ (err).code !== 'ENOENT') throw err;
+        return false;
+      }),
+    ]);
+    return object || variants;
+  }
+
+  /** @param {string} token */
+  async discardDetached(token) {
+    if (!TOKEN_RE.test(token)) throw new Error('invalid token');
+    await Promise.all([
+      rm(this.#trashPath(token, 'object'), { force: true }),
+      rm(this.#trashPath(token, 'variants'), { recursive: true, force: true }),
+    ]);
+  }
+
+  /**
+   * @param {string} token
+   * @param {'object'|'variants'} kind
+   */
+  #trashPath(token, kind) {
+    return join(this.dataDir, 'trash', `${token}.${kind}`);
   }
 
   /**

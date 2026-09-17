@@ -155,6 +155,13 @@ export class Storage {
    * Remove the content at `key`. Removing an `object` key also removes every `variant` key
    * derived from it — a variant has no independent lifetime, so a caller never has to enumerate
    * and remove each one itself. Safe to call when nothing is stored at `key`.
+   *
+   * Stage 8.2: a plain `remove()` races a concurrent write on the SAME path (nothing stops a
+   * `commit()`/`writeAtomic()` from landing between whatever check a caller made and this actually
+   * running) — `MediaService`'s purge no longer calls this directly for exactly that reason, using
+   * {@link detachForDelete}/{@link discardDetached} instead. `remove()` itself is unchanged and
+   * still correct for a caller that owns the key exclusively (nothing else concurrently writes to
+   * it) — there is no other such caller today.
    * @param {StorageKey} key
    * @returns {Promise<void>}
    */
@@ -165,5 +172,35 @@ export class Storage {
   /** Discard a temp entry that was never committed. @param {TempKey} key @returns {Promise<void>} */
   async discard(key) {
     throw new Error('Storage.discard must be overridden');
+  }
+
+  /**
+   * Stage 8.2 physical-delete fencing: atomically detach the canonical bytes at `key` — and every
+   * variant derived from it — into quarantine scoped to `token`, in one step. The instant this
+   * returns, the canonical location(s) no longer exist at all: a concurrent `commit()`/
+   * `writeAtomic()` for the same key is completely free to recreate a brand-new, independent file
+   * there, because there is nothing left to collide or dedupe against. This is what makes a stale
+   * purge unable to ever delete a fresh upload's bytes, however the two interleave — unlike a
+   * plain `remove()`, which can race a concurrent write on the SAME path.
+   *
+   * Only `discardDetached` (never `remove`, never a second `detachForDelete`) may act on what
+   * this detached — the canonical path itself is never touched again under this token.
+   * @param {ObjectKey} key
+   * @param {string} token Caller-minted, unique per call — never reused.
+   * @returns {Promise<boolean>} whether there was anything to detach.
+   */
+  async detachForDelete(key, token) {
+    throw new Error('Storage.detachForDelete must be overridden');
+  }
+
+  /**
+   * Permanently remove everything `detachForDelete` quarantined under `token`. Only ever touches
+   * that token's own quarantine location — never the canonical path, regardless of what has
+   * happened there since. Safe to call more than once, or on a token nothing was detached under.
+   * @param {string} token
+   * @returns {Promise<void>}
+   */
+  async discardDetached(token) {
+    throw new Error('Storage.discardDetached must be overridden');
   }
 }

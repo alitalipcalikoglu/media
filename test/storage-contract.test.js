@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { buffer as streamToBuffer } from 'node:stream/consumers';
 import { test } from 'node:test';
 import { LocalStorage } from '../src/storage/local-storage.js';
@@ -193,6 +194,59 @@ function contract(name, makeBackend) {
       assert.ok(committed === true || committed === false, 'commit() resolves normally (true or false), never throws, even racing a concurrent remove()');
       const finalState = await storage.exists(key);
       assert.equal(typeof finalState, 'boolean', 'the key ends up in one well-defined state, present or absent — never a partial/corrupt object');
+    } finally { cleanup(); }
+  });
+
+  // -------------------------------------------------------- Stage 8.2 physical-delete fencing
+
+  test(`${name}: detachForDelete fences the object and its variants into quarantine in one call; a concurrent commit is free to recreate the canonical key`, async () => {
+    const { storage, cleanup } = makeBackend();
+    try {
+      await storage.prepare();
+      const sha256 = 'f'.repeat(64);
+      const objectKey = { kind: /** @type {const} */ ('object'), sha256 };
+      await storage.writeAtomic(objectKey, Buffer.from('original'));
+      await storage.writeAtomic({ kind: 'variant', sha256, name: 'thumb' }, Buffer.from('variant'));
+
+      const token = randomUUID();
+      assert.equal(await storage.detachForDelete(objectKey, token), true, 'there was something to detach');
+      assert.equal(await storage.exists(objectKey), false, 'canonical object gone the instant detach returns');
+      assert.equal(await storage.stat({ kind: 'variant', sha256, name: 'thumb' }), null, 'variant fenced along with the object, same call');
+
+      // A concurrent commit for the SAME key, after detach, is completely free — nothing to
+      // collide or dedupe against.
+      const t = await storage.writeTemp(streamOf(Buffer.from('fresh')), { maxBytes: 100 });
+      assert.equal(await storage.commit(t.key, objectKey), true, 'fresh, independent content — not a dedupe');
+      assert.equal((await streamToBuffer(await storage.open(objectKey))).toString(), 'fresh');
+
+      // discardDetached only ever removes the quarantine copy — the fresh canonical content survives.
+      await storage.discardDetached(token);
+      assert.equal(await storage.exists(objectKey), true, 'INVARIANT: the fresh content survives a late discardDetached');
+      assert.equal((await streamToBuffer(await storage.open(objectKey))).toString(), 'fresh');
+    } finally { cleanup(); }
+  });
+
+  test(`${name}: detachForDelete/discardDetached on nothing are safe no-ops`, async () => {
+    const { storage, cleanup } = makeBackend();
+    try {
+      await storage.prepare();
+      const sha256 = 'a1'.repeat(32);
+      const token = randomUUID();
+      assert.equal(await storage.detachForDelete({ kind: 'object', sha256 }, token), false, 'nothing was there to detach');
+      await storage.discardDetached(token); // must not throw
+      await storage.discardDetached(randomUUID()); // a token nothing was ever detached under: still must not throw
+    } finally { cleanup(); }
+  });
+
+  test(`${name}: detachForDelete rejects a malformed token (same allowlist discipline as every other key field)`, async () => {
+    const { storage, cleanup } = makeBackend();
+    try {
+      await storage.prepare();
+      const key = { kind: /** @type {const} */ ('object'), sha256: 'b2'.repeat(32) };
+      for (const bad of ['../../etc/passwd', '..', '', 'not-a-token']) {
+        await assert.rejects(storage.detachForDelete(key, bad), `token ${JSON.stringify(bad)} must be rejected`);
+        await assert.rejects(storage.discardDetached(bad), `token ${JSON.stringify(bad)} must be rejected`);
+      }
     } finally { cleanup(); }
   });
 }

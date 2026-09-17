@@ -21,7 +21,9 @@ SQLite (`DB_PATH`): `blobs` (sha256-keyed), `files` (references a blob, soft-del
 `deleted_at`), `upload_tickets` (hashed token, single use). Object storage on disk:
 `<dataDir>/objects/<sha2>/<sha4>/<sha256>` (immutable originals), `<dataDir>/variants/<sha256>/
 <name>.webp` (derived), `<dataDir>/tmp/<uuid>` (in-flight uploads, written with `flags:'wx', mode
-0600`, moved into place with `rename`).
+0600`, moved into place with `rename`), `<dataDir>/trash/<token>.object` / `<token>.variants`
+(Stage 8.2: purge's quarantine — an object/variant-directory pair a stale purge has fenced off from
+the canonical path but not yet permanently removed; never referenced by anything live).
 
 ## Health endpoint
 
@@ -144,22 +146,23 @@ second instance starting later would do to the first instance's already-in-fligh
 - `/ready` (or any prior version of it) triggering `prepare()`'s destructive wipe: fixed in Stage 0
   — the readiness path is now non-destructive (`check()`); `prepare()` only ever runs once, at
   process start.
-- **Purge racing a fresh upload of the same content: closed (Stage 8.1).** Previously an open, P0
+- **Purge racing a fresh upload of the same content: closed (Stage 8.2).** Previously an open, P0
   gap (planned but never actually implemented back at Stage 0) — a fresh upload of content whose
   blob row purge had just deleted, landing in the narrow window before the bytes were physically
-  removed, could leave a live file referencing bytes that no longer existed. See "Purge/upload
-  race protocol" below for the closed design and its guarantee.
+  removed, could leave a live file referencing bytes that no longer existed. Stage 8.1 closed the
+  DB-row half of this (the mark/reclaim/finalize CAS below) but left a second, independent window
+  open between the DB delete committing and the later physical byte removal — a fresh upload could
+  still dedupe against, and then lose, bytes a stale purge was about to unlink from the same path.
+  See "Purge/upload race protocol" below for the complete, closed design and its guarantee.
 
-## Purge/upload race protocol (Stage 8.1)
+## Purge/upload race protocol (Stage 8.2)
 
-**Guarantee**: for every committed live file row, its referenced content-addressed object is
-readable after every completed upload/purge operation, regardless of how the two interleave.
-Enforced entirely through SQLite (compare-and-swap on a per-blob token), never a process-local
-lock — correct even if maintenance and HTTP upload run in separate processes (not today's
-supported topology, see "Single-node / multi-node guarantees" above, but the protocol doesn't
-assume otherwise).
+**Guarantee**: for any purge generation P and upload U of the same content, once U has committed a
+live DB reference, P has no operation remaining that can remove U's canonical bytes — regardless
+of how the two interleave. Two independent mechanisms combine to prove this; neither alone is
+enough (see "Why this is provable" below).
 
-Blob deletion is two-phase, `FileStore#markOrphanBlobs()` then `FileStore#finalizeOrphanBlobs()`,
+Blob *row* deletion is two-phase, `FileStore#markOrphanBlobs()` then `FileStore#finalizeOrphanBlobs()`,
 run as two separate, un-batched statements (deliberately not one transaction) so a concurrent
 upload's own transaction has a real chance to land in between:
 
@@ -172,32 +175,76 @@ upload's own transaction has a real chance to land in between:
 3. **Finalize**: for every still-orphaned, currently-marked row (from this pass or an earlier one
    that crashed before finalizing), `DELETE … WHERE sha256 = ? AND delete_token = ?` — the
    compare-and-swap. A token cleared by a reclaim between mark and finalize makes this match zero
-   rows: the row, and therefore the bytes, survive. Only a row this DELETE actually removed is
-   safe to physically remove — by that point nothing can "un-delete" it; a fresh upload of the
-   same content afterward starts an entirely new row.
-4. **Physical removal**, per confirmed sha256, after finalize — never before. A failure here
-   (`storage.remove()` throwing) is caught per item, logged, and never aborts the rest of the
-   batch or re-throws out of `purge()`: the DB row is already gone for good either way.
+   rows: the row, and therefore the bytes, survive.
 
-**Upload-side self-heal** closes the one remaining gap the two-phase delete alone can't: if
-`storage.commit()` deduped (the content already existed) but a stale purge finalized-and-removed
-those exact bytes in the narrow window before `createFile()`'s row lands, `MediaService.upload`
-re-checks `storage.exists()` after its DB write and, if the object is genuinely gone, `commit()`s
-again from its own still-held temp copy (bounded to `MediaService.SELF_HEAL_ATTEMPTS`, never an
-unbounded retry). `commit()`'s `link()`-based atomicity (Stage 8) makes this safe to retry.
+This alone only guarantees "no live file referenced this blob at the instant the DB delete
+committed" — it says nothing about a fresh upload landing *after* that instant but *before* the
+physical bytes are actually removed. Two more steps close that:
+
+4. **Final guard** (optimization, not the correctness argument): immediately before touching
+   physical bytes, `MediaService#purge` re-checks `files.blob(sha256)` — a fresh, uncached query.
+   If a row now exists (a fresh upload's DB write landed since the CAS delete), the physical step
+   is skipped entirely for this sha256. This narrows how often step 5 runs; it is not load-bearing
+   by itself, because its own snapshot can still go stale before step 5 executes.
+5. **Physical fencing**: `storage.detachForDelete(key, token)` — one atomic filesystem `rename()`
+   of the canonical object (and its variant directory, same call, same token) into a quarantine
+   path scoped to a fresh, single-use `token`. The instant this returns, the canonical path is
+   either already free for a concurrent `commit()`/`writeAtomic()` to recreate independently, or a
+   concurrent upload already recreated it before this ran (nothing to detach — `commit()`'s
+   `link()`-based atomicity, Stage 8, guarantees that recreation is itself race-free). Either way,
+   this purge generation can never again touch whatever now lives at the canonical path — only
+   `storage.discardDetached(token)` on its own quarantine copy, later. A failure in either call is
+   caught per item, logged, and never aborts the rest of the batch or re-throws out of `purge()`.
+
+**Upload-side self-heal** closes the one remaining sub-window neither the final guard nor the
+fencing rename covers by itself: if `storage.commit()` deduped (the content already existed) but a
+stale purge's `detachForDelete` quarantined those exact bytes in the narrow window between the
+dedup check and `createFile()`'s row landing, `MediaService.upload` re-checks `storage.exists()`
+after its DB write and, if the object is genuinely gone, `commit()`s again from its own still-held
+temp copy. This is bounded to exactly `MediaService.SELF_HEAL_ATTEMPTS = 1` retry — not an
+arbitrary number: `exists()` can only be false here once the stale purge's *one* atomic rename for
+this sha256 has already fully completed, at which point the canonical path is guaranteed empty (no
+other party can be holding it — that purge generation already spent its single fencing op on this
+exact sha256), so the very next `commit()` (an atomic `link`) is guaranteed to succeed. A second
+retry would only re-prove the same fact.
+
+**Why this is provable**: the mark/reclaim/finalize CAS guarantees a physical delete is only ever
+*attempted* for a blob that was genuinely unreferenced at CAS time. The fencing rename guarantees
+that whatever that attempt does, it can never touch bytes a fresh upload has (or will) recreate at
+the canonical path — a rename is a single atomic syscall, so there is no instant where the path is
+"half gone" for another party to observe and act on inconsistently. Self-heal closes the one
+remaining case (upload's dedup check ran just before the rename, but its own DB write lands just
+after) with a retry that is deterministic, not probabilistic, given the rename's atomicity. No
+combination of these three leaves a window where a live DB reference points at removed bytes.
 
 **Crash semantics**: a crash after mark but before finalize leaves the mark in place — the next
-maintenance pass's finalize (not just this one) re-scans and picks it up, no special recovery
-step needed. A crash after finalize (row deleted) but before the physical unlink leaks the bytes
-on disk permanently in this build (no live reference exists, so this is disk bloat, not a
-correctness violation) — accepted, matches the project's existing "orphan bytes may remain, a
-future stage may add a disk-vs-DB reconciliation sweep" stance. A live DB reference to
+maintenance pass's finalize (not just this one) re-scans and picks it up, no special recovery step
+needed. A crash after finalize (DB row deleted) but before `detachForDelete` leaks the bytes on
+disk permanently (no live reference exists, so this is disk bloat, not a correctness violation). A
+crash after `detachForDelete` (bytes quarantined) but before `discardDetached` leaks the quarantine
+copy instead — same acceptance, and the canonical path stays correctly empty/reclaimed either way.
+Neither the `delete_token` scheme nor the quarantine token is ever resumed across a restart (no
+reconciliation sweep for `trash/` in this build, matching the project's existing "orphan bytes may
+remain, a future stage may add a disk-vs-DB reconciliation sweep" stance) — a live DB reference to
 permanently-missing bytes is what's actually forbidden, and no crash window produces it.
 
+**Variant cascade**: `detachForDelete` moves the original and its entire variant directory into
+quarantine in the same call, under the same token — physical purge ownership of an object and its
+variants always belongs to one generation. A stale purge can therefore never delete a live file's
+freshly-regenerated variant, even if it finishes (`discardDetached`) after the new generation's
+variant was created: the quarantine copy and the fresh, canonical variant are different paths.
+
 Test coverage: `test/purge-race.test.js` (real `MediaService` + real SQLite + real `LocalStorage`,
-the exact interleaving from the original bug report, both crash windows, `storage.remove()`
-throwing, idempotent re-maintenance, and that an unrelated purge never touches a live file's
-object or its cached variants).
+no fakes) — the four required deterministic interleavings (mark-then-reclaim; finalize-then-
+full-upload-then-stale-continuation; physical-detach-then-upload; a second generation existing
+when a later/duplicate pass runs), every crash window above, `detachForDelete`/`discardDetached`
+throwing, idempotent re-maintenance, and that an unrelated purge — or a stale purge finishing
+late — never touches a live file's object or its (possibly freshly-regenerated) variants.
 - Disk full mid-upload: the write fails, the temp file is not moved into place, the client sees an
   error; no partial object is left in `objects/`.
 - Two instances sharing one `dataDir`: unsupported, see above — avoid.
+- `trash/` (Stage 8.2 quarantine) is never reconciled automatically: a crash between
+  `detachForDelete` and `discardDetached` leaks a quarantined copy there permanently in this build
+  — accepted disk bloat, not a correctness issue (see "Crash semantics" above). Deliberately
+  excluded from `stack`'s backup/restore (`Snapshot` only ever captures `objects`/`variants`):
+  nothing live ever points into `trash/`, so it is disposable orphaned data, not state to preserve.
