@@ -58,7 +58,7 @@ Errors are JSON: `{ "error": { "code", "message", "details?" } }`.
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
-| GET | `/health`, `/ready` | none | Liveness; readiness (database and data directory writable, cached 30 s). |
+| GET | `/health`, `/ready`, `/v1/info` | none | Liveness; readiness (database and data directory writable, cached 30 s); service identity (version, API version, capabilities, schema version, service-core version). |
 | PUT | `/v1/files?visibility=&name=` | API key | Upload raw body. `201` with `file`. Headers: `Content-Type`, `X-File-Name`. |
 | GET | `/v1/files?limit=&cursor=` | API key | Own files, newest first. |
 | GET / PATCH / DELETE | `/v1/files/:id` | API key | Metadata; change `visibility` / `name`; soft delete (`204`). |
