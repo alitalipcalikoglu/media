@@ -30,6 +30,15 @@ test('probes are public; /v1 and /metrics need an API key', async () => {
   assert.equal((await app.inject({ url: '/nope', headers: auth })).statusCode, 404);
 });
 
+test('/ready never disturbs an upload that is still streaming into tmp', async () => {
+  const { streamOf } = await import('./helpers.js');
+  const receiving = t.service.storage.receive(streamOf(Buffer.from('in-flight upload bytes')), { maxBytes: 1_000_000 });
+  assert.equal((await app.inject('/ready')).statusCode, 200, 'first poll (may run storage.check())');
+  assert.equal((await app.inject('/ready')).statusCode, 200);
+  const received = await receiving;
+  assert.equal(await t.service.storage.commit(received.tmpPath, received.sha256), true, 'the upload that was in flight during /ready still commits');
+});
+
 test('PUT /v1/files stores a raw body, GET/PATCH/DELETE/restore manage it', async () => {
   const jpg = await testImage({ width: 800, height: 600 });
   let res = await call('PUT', '/v1/files?visibility=public', { payload: jpg, headers: { 'content-type': 'image/jpeg', 'x-file-name': encodeURIComponent('tatil fotoğrafı.JPG') } });

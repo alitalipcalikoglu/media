@@ -41,7 +41,7 @@ export class Application {
 
   async start() {
     const { config } = this;
-    await this.storage.init();
+    await this.storage.prepare();
     const service = new MediaService({
       files: this.files, tickets: this.tickets, storage: this.storage,
       images: new ImageProcessor({ maxPixels: config.maxImagePixels, quality: config.variantQuality }),

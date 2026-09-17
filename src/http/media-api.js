@@ -153,7 +153,7 @@ export class MediaApi {
       if (now - this.readyCache.at > MediaApi.READY_CACHE_MS) {
         try {
           this.db.ping();
-          await this.service.storage.init();
+          await this.service.storage.check();
           this.readyCache = { at: now, ok: true, error: '' };
         } catch (err) {
           this.readyCache = { at: now, ok: false, error: err instanceof Error ? err.message : String(err) };

@@ -62,13 +62,23 @@ test('LocalStorage receives, hashes, limits, dedupes and removes objects', async
   assert.equal(await storage.statPath(storage.variantDir(r.sha256)), null);
 });
 
-test('LocalStorage.init clears interrupted uploads from tmp', async () => {
+test('LocalStorage.prepare clears interrupted uploads from tmp', async () => {
   const storage = await testStorage(join(dir, 's2'));
   const r = await storage.receive(streamOf('leftover'), { maxBytes: 100 });
   assert.equal(readdirSync(join(dir, 's2', 'tmp')).length, 1);
-  await storage.init();
+  await storage.prepare();
   assert.equal(readdirSync(join(dir, 's2', 'tmp')).length, 0);
   void r;
+});
+
+test('LocalStorage.check never touches tmp contents (safe for readiness probes)', async () => {
+  const storage = await testStorage(join(dir, 's3'));
+  const r = await storage.receive(streamOf('in-flight upload'), { maxBytes: 100 });
+  assert.equal(readdirSync(join(dir, 's3', 'tmp')).length, 1);
+  await storage.check();
+  await storage.check();
+  assert.equal(readdirSync(join(dir, 's3', 'tmp')).length, 1, 'check() must not remove an in-flight upload');
+  assert.equal(await storage.commit(r.tmpPath, r.sha256), true, 'the upload can still be committed after check()');
 });
 
 test('UrlSigner signs and verifies with expiry and constant-time compare', () => {

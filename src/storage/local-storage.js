@@ -39,11 +39,23 @@ export class LocalStorage {
     this.dataDir = dataDir;
   }
 
-  async init() {
+  /**
+   * Create the directory layout and clear `tmp` of anything left by an interrupted upload. Call
+   * once at process start, never from a readiness probe: it deletes in-flight upload files.
+   */
+  async prepare() {
     await Promise.all(['tmp', 'objects', 'variants'].map((d) => mkdir(join(this.dataDir, d), { recursive: true })));
-    // Anything left in tmp belongs to an interrupted upload.
     await rm(join(this.dataDir, 'tmp'), { recursive: true, force: true });
     await mkdir(join(this.dataDir, 'tmp'), { recursive: true });
+    return this;
+  }
+
+  /**
+   * Cheap, non-destructive readiness check: the directory layout exists and is writable. Safe to
+   * call on every `/ready` poll; never touches `tmp` contents.
+   */
+  async check() {
+    await Promise.all(['tmp', 'objects', 'variants'].map((d) => mkdir(join(this.dataDir, d), { recursive: true })));
     return this;
   }
 

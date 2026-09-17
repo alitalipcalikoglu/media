@@ -39,7 +39,7 @@ export function tempDir() {
 
 /** @param {string} dir */
 export async function testStorage(dir) {
-  return new LocalStorage(dir).init();
+  return new LocalStorage(dir).prepare();
 }
 
 /** @param {Buffer|string} data */
