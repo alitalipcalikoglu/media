@@ -1,10 +1,7 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { Database as CoreDatabase } from '@atc-web/service-core/db';
 
 /** SQLite connection with schema migrations applied on open. */
-export class Database {
-  /** @type {readonly string[]} */
+export class Database extends CoreDatabase {
   static MIGRATIONS = [
     `
     CREATE TABLE blobs (
@@ -44,61 +41,4 @@ export class Database {
     CREATE INDEX upload_tickets_expiry ON upload_tickets (expires_at);
     `,
   ];
-
-  /** @param {string} path File path, or ":memory:". */
-  constructor(path) {
-    if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-    /** @readonly */
-    this.raw = new DatabaseSync(path);
-    this.raw.exec('PRAGMA journal_mode = WAL');
-    this.raw.exec('PRAGMA synchronous = NORMAL');
-    this.raw.exec('PRAGMA busy_timeout = 5000');
-    this.raw.exec('PRAGMA foreign_keys = ON');
-    this.#migrate();
-  }
-
-  #migrate() {
-    const { user_version: current } = /** @type {{ user_version: number }} */ (this.raw.prepare('PRAGMA user_version').get());
-    for (let v = current; v < Database.MIGRATIONS.length; v++) {
-      this.raw.exec('BEGIN');
-      try {
-        this.raw.exec(Database.MIGRATIONS[v]);
-        this.raw.exec(`PRAGMA user_version = ${v + 1}`);
-        this.raw.exec('COMMIT');
-      } catch (err) {
-        this.raw.exec('ROLLBACK');
-        throw err;
-      }
-    }
-  }
-
-  /** @param {string} sql */
-  prepare(sql) {
-    return this.raw.prepare(sql);
-  }
-
-  /**
-   * @template T
-   * @param {() => T} fn
-   * @returns {T}
-   */
-  transaction(fn) {
-    this.raw.exec('BEGIN IMMEDIATE');
-    try {
-      const out = fn();
-      this.raw.exec('COMMIT');
-      return out;
-    } catch (err) {
-      this.raw.exec('ROLLBACK');
-      throw err;
-    }
-  }
-
-  ping() {
-    this.raw.prepare('SELECT 1').get();
-  }
-
-  close() {
-    this.raw.close();
-  }
 }

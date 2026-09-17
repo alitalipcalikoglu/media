@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
-import { AuditClient } from '../net/audit-client.js';
+import { AuditClient } from '@atc-web/service-core/audit';
+import { createErrorHandler, registerProbes } from '@atc-web/service-core/fastify';
 import { MediaError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Cors } from './cors.js';
@@ -46,7 +47,7 @@ export class MediaApi {
    * @param {import('../db.js').Database} deps.db
    * @param {import('../store/file-store.js').FileStore} deps.files
    * @param {import('../types.js').Logger} [deps.logger]
-   * @param {import('../net/audit-client.js').AuditClient} [deps.audit]
+   * @param {import('@atc-web/service-core/audit').AuditClient} [deps.audit]
    */
   constructor({ config, audit, service, db, files, logger }) {
     this.config = config;
@@ -58,7 +59,6 @@ export class MediaApi {
     this.auth = new ApiKeyAuth(config.apiKeys);
     this.cors = new Cors(config.corsOrigins);
     this.fileServer = new FileServer();
-    this.readyCache = { at: 0, ok: false, error: '' };
     this.counters = { uploads: 0, downloads: 0, bytesOut: 0 };
   }
 
@@ -78,13 +78,21 @@ export class MediaApi {
     // Uploads arrive as raw bodies of any type; hand the stream through untouched.
     app.addContentTypeParser('*', (_request, payload, done) => done(null, payload));
     app.decorateRequest('apiKeyId', '');
-    app.setErrorHandler(this.#errorHandler);
+    app.setErrorHandler(createErrorHandler(MediaError, {
+      extra: (err, _request, reply) => {
+        if (err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') { reply.code(413).send({ error: { code: 'TOO_LARGE', message: `upload exceeds ${this.config.maxUploadBytes} bytes` } }); return true; }
+        return false;
+      },
+    }));
     app.addHook('onSend', AuditClient.hook(this.audit));
     app.setNotFoundHandler((_request, reply) => {
       reply.code(404).send({ error: { code: 'NOT_FOUND', message: 'route not found' } });
     });
     if (this.cors.enabled) app.addHook('onRequest', this.cors.hook);
-    this.#registerProbes(app);
+    registerProbes(app, async () => {
+      this.db.ping();
+      await this.service.storage.check();
+    }, { cacheMs: MediaApi.READY_CACHE_MS });
     this.#registerDelivery(app);
     this.#registerTicketUpload(app);
     await app.register((api) => this.#registerV1(api), { prefix: '/v1' });
@@ -92,25 +100,6 @@ export class MediaApi {
     return app;
   }
 
-  /** @type {FastifyInstance['errorHandler']} */
-  #errorHandler = (rawErr, request, reply) => {
-    const err = /** @type {import('fastify').FastifyError & { validation?: { instancePath: string, message?: string, params: object }[] }} */ (rawErr);
-    if (err instanceof MediaError) {
-      return reply.code(err.statusCode).send({ error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) } });
-    }
-    if (err.validation) {
-      return reply.code(400).send({ error: { code: 'VALIDATION_FAILED', message: err.message, details: err.validation.map((v) => ({ path: v.instancePath, message: v.message, params: v.params })) } });
-    }
-    if (err.code === 'FST_ERR_CTP_BODY_TOO_LARGE') {
-      return reply.code(413).send({ error: { code: 'TOO_LARGE', message: `upload exceeds ${this.config.maxUploadBytes} bytes` } });
-    }
-    const status = err.statusCode && err.statusCode >= 400 && err.statusCode < 600 ? err.statusCode : 500;
-    if (status >= 500) {
-      request.log.error({ err }, 'unhandled error');
-      return reply.code(status).send({ error: { code: 'INTERNAL_ERROR', message: 'internal error' } });
-    }
-    return reply.code(status).send({ error: { code: err.code ?? 'REQUEST_ERROR', message: err.message } });
-  };
 
   /**
    * @param {FileRecord} f
@@ -143,28 +132,6 @@ export class MediaApi {
     } catch {
       return header;
     }
-  }
-
-  /** @param {FastifyInstance} app */
-  #registerProbes(app) {
-    app.get('/health', { logLevel: 'warn' }, async () => ({ status: 'ok' }));
-    app.get('/ready', { logLevel: 'warn' }, async (_request, reply) => {
-      const now = Date.now();
-      if (now - this.readyCache.at > MediaApi.READY_CACHE_MS) {
-        try {
-          this.db.ping();
-          await this.service.storage.check();
-          this.readyCache = { at: now, ok: true, error: '' };
-        } catch (err) {
-          this.readyCache = { at: now, ok: false, error: err instanceof Error ? err.message : String(err) };
-        }
-      }
-      if (!this.readyCache.ok) {
-        app.log.warn({ error: this.readyCache.error }, 'readiness check failed');
-        return reply.code(503).send({ status: 'unavailable', error: this.readyCache.error });
-      }
-      return { status: 'ok' };
-    });
   }
 
   /** Public + signed delivery. @param {FastifyInstance} app */
