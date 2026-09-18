@@ -42,6 +42,8 @@
  * @property {number} signedUrlTtlSec
  * @property {number} uploadTicketTtlSec
  * @property {number} deleteGraceDays
+ * @property {number} trashGraceMs      How long a detachForDelete()'d quarantine entry sits before reconciliation removes it.
+ * @property {number} trashMaxEntries   Cap on how many quarantine entries one maintenance pass inspects.
  * @property {string[]} corsOrigins
  */
 

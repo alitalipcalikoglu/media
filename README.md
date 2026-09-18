@@ -106,6 +106,7 @@ Required: `MEDIA_API_KEYS`, `PUBLIC_BASE_URL`, `SIGNING_SECRET`. `PUBLIC_BASE_UR
 
 - `STORAGE_DRIVER` (default `local`) — which `Storage` backend to use. `local` (`LocalStorage`) is the only value that exists today; anything else fails startup immediately with a `ConfigError`, never a silent fallback. See "Code layout" for the `Storage` interface itself.
 - `MAX_CONCURRENT_VARIANTS` (default `4`) and `VARIANT_WAIT_TIMEOUT_MS` (default `30000`) — bound CPU-heavy on-demand variant generation; see "Scaling model" below for the exact semantics.
+- `TRASH_GRACE_MS` (default `3600000`, one hour) and `TRASH_MAX_ENTRIES` (default `1000`) — trash reconciliation's age threshold and per-run cap; see "Maintenance" below.
 
 ### Rotating `SIGNING_SECRET`
 
@@ -161,7 +162,7 @@ Class-based; dependencies are injected through constructors, `src/application.js
 | `FileName`, `MediaError` | `src/domain/` | Safe names, error codes |
 | `UrlSigner` | `src/url-signer.js` | HMAC signed URLs |
 | `MediaApi`, `FileServer`, `Cors`, `ApiKeyAuth`, `Schemas` | `src/http/` | Routes, delivery, browser access |
-| `Maintenance` | `src/maintenance.js` | Hourly purge |
+| `Maintenance` | `src/maintenance.js` | Purge on three triggers (hourly, startup, manual via `stack maintenance media`); see "Maintenance" |
 
 ## Out of scope by design
 
@@ -179,7 +180,12 @@ With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwa
 **B — single-node stateful.** One process owns the SQLite file and the local object-storage directory.
 Deferred variant generation de-duplicates concurrent requests for the same variant only within one
 process — two instances asked for the same missing variant would both encode it (wasted work, not
-corruption). Two instances sharing one data directory are not supported.
+corruption). Two *serving* instances sharing one data directory are not supported. The one narrow,
+deliberate exception is `stack maintenance media`'s one-shot, non-serving run (see "Maintenance"):
+it never binds a port, never generates variants, never calls `LocalStorage#prepare()`, and only ever
+calls the same `purge()` whose correctness under concurrent execution (DB compare-and-swap, storage
+fencing) was already required to hold against the live server's own timer — this is not a second
+kind of "instance", and does not relax the single-serving-instance rule above.
 
 **Variant generation concurrency (Stage 8).** Two layers, always in this order:
 1. **Dedupe** — every concurrent request for the exact same `(object, variant)` shares one
@@ -199,6 +205,46 @@ corruption). Two instances sharing one data directory are not supported.
 
 Accepts an inbound `X-Request-Id` unconditionally and logs it via Fastify's default request
 logging. Does not parse or forward `traceparent`.
+
+## Maintenance
+
+`Maintenance` (`src/maintenance.js`) purges soft-deleted files past `DELETE_GRACE_DAYS`, finalizes
+orphaned blobs, purges expired upload tickets, and reconciles `trash/` (see below) — on three
+triggers, all running the exact same `MediaService#purge()`: the hourly timer, one eager run at
+startup, and an operator-triggered manual run. There is **no HTTP route** for the manual trigger —
+media's API keys are flat (`id:secret`, no role concept, shared identically by every `/v1/*` route
+including delivery and `/metrics`), so an admin-only route here would either blur that boundary or
+require inventing a role concept for one operation. The manual trigger instead goes through the
+`stack` control plane, the same trust boundary `stack backup`/`stack restore` already assume:
+
+```bash
+stack maintenance media
+```
+
+(or `Stack#maintenance('media')` from code). This constructs the real `Config`/`Database`/
+`LocalStorage`/`FileStore`/`TicketStore`/`MediaService`/`Maintenance` graph directly against the
+service's own `.env`/data directory — the same classes `Application#start` wires, minus the HTTP
+listener — and calls the real `Maintenance#run('manual')`. It never calls `LocalStorage#prepare()`
+(that stays exclusively the live server's own startup step, since it destructively wipes `tmp/`),
+and it is safe to run while the real media server is already up: two independent runs racing the
+same content are made safe by the same DB compare-and-swap and storage fencing that already make
+the timer and startup-eager runs safe against each other (see `docs/READINESS.md` "Purge/upload
+race"), not by anything specific to being in the same process — proven directly in
+`test/maintenance-concurrency.test.js` with two fully independent `MediaService` instances sharing
+one real database file and data directory. The result is a bounded, machine-readable, secret- and
+path-free summary: `{ files, blobs, tickets, trashReconciled, trashSkipped, trashErrors, errors }`.
+
+**Trash reconciliation** (`LocalStorage#reconcileTrash`) closes the one remaining disk leak in the
+purge protocol: `detachForDelete()` quarantines an object's bytes into `trash/<token>.object`(`
+/.variants`) before `discardDetached()` permanently removes them; a crash between those two calls
+leaves the quarantine copy on disk forever without reconciliation. Every maintenance run — timer,
+startup, manual — sweeps `trash/` for quarantine entries older than `TRASH_GRACE_MS`, bounded to
+`TRASH_MAX_ENTRIES` per run, in deterministic (sorted) order. **Never touches the canonical
+`objects`/`variants` namespaces** — a fresh upload that reused the same sha256 after a crashed
+detach lives at a completely independent inode (`detachForDelete` renames, never copies), so
+cleaning up an old quarantine entry can never affect a live, re-created canonical object. An entry
+this backend doesn't recognise as its own (wrong name shape, a symlink, a file where a directory is
+expected or the reverse) is skipped and counted, never deleted, never followed.
 
 ## Backup / restore
 

@@ -137,9 +137,16 @@ CPU, not corruption — the file that lands is a valid encode either way).
 
 ## Single-node / multi-node guarantees
 
-One process per data directory. Two instances pointed at the *same* `dataDir` are not supported:
-besides the variant-generation duplication above, `prepare()` at startup wipes `tmp/`, which a
-second instance starting later would do to the first instance's already-in-flight uploads.
+One *serving* process per data directory. Two serving instances pointed at the *same* `dataDir` are
+not supported: besides the variant-generation duplication above, `prepare()` at startup wipes
+`tmp/`, which a second instance starting later would do to the first instance's already-in-flight
+uploads. Post-production Phase 4's `stack maintenance media` is a deliberate, narrow exception, not
+a second serving instance: it never calls `prepare()` (only `check()`, non-destructive), never binds
+a port, never generates variants, and only ever calls the same `Maintenance#run()`/`MediaService#
+purge()` whose correctness under two independent, concurrent callers was already required to hold
+(the live server's own timer vs. its own startup-eager run are already two concurrent callers in the
+combined-role case) — proven directly across two fully independent object graphs sharing one real DB
+file and data directory in `test/maintenance-concurrency.test.js`, not merely re-asserted.
 
 ## Known failure modes
 
@@ -223,10 +230,28 @@ needed. A crash after finalize (DB row deleted) but before `detachForDelete` lea
 disk permanently (no live reference exists, so this is disk bloat, not a correctness violation). A
 crash after `detachForDelete` (bytes quarantined) but before `discardDetached` leaks the quarantine
 copy instead — same acceptance, and the canonical path stays correctly empty/reclaimed either way.
-Neither the `delete_token` scheme nor the quarantine token is ever resumed across a restart (no
-reconciliation sweep for `trash/` in this build, matching the project's existing "orphan bytes may
-remain, a future stage may add a disk-vs-DB reconciliation sweep" stance) — a live DB reference to
+The `delete_token` scheme itself is naturally resumed across a restart (the next `markOrphanBlobs`/
+`finalizeOrphanBlobs` pass just re-scans, per "Crash semantics" above); the quarantine token is not
+(each is a one-off `randomUUID()`, never persisted) — post-production Phase 4 closed exactly this gap
+with `LocalStorage#reconcileTrash` (age-based, not token-tracked: see "Trash reconciliation" below),
+not a restart-time resume, since there is nothing to resume — a live DB reference to
 permanently-missing bytes is what's actually forbidden, and no crash window produces it.
+
+**Trash reconciliation (post-production Phase 4)**: every maintenance pass — timer, startup-eager,
+and the operator-triggered manual run (`stack maintenance media`) — sweeps `trash/` for quarantine
+entries older than `TRASH_GRACE_MS` (bounded to `TRASH_MAX_ENTRIES` per run, deterministic order).
+Age is the entry's own `ctime` (verified empirically: a real `rename()` — what `detachForDelete`
+does — updates it; `mtime` does not, and would have reflected the ORIGINAL upload's write time
+instead, an unrelated and often much older timestamp). No new DB table: quarantine's own filesystem
+state (age plus the existing `<token>.object`/`<token>.variants` naming convention) is sufficient,
+matching this project's SQLite-source-of-truth-for-live-state convention rather than tracking the
+existence of already-unreferenced garbage. Never touches the canonical `objects`/`variants`
+namespaces — a fresh upload reusing the same sha256 after a crashed detach lives at a completely
+independent inode from the moment of detach onward (rename, never copy), so reconciling an old
+quarantine entry can never affect a live, re-created canonical object; proven as a deterministic
+regression, not just argued (`test/trash-reconcile.test.js`). An entry not recognisably this
+backend's own quarantine format (wrong name shape, a symlink, a file where a directory is expected
+or the reverse) is skipped and counted, never deleted, never followed — fail-safe, not best-effort.
 
 **Variant cascade**: `detachForDelete` moves the original and its entire variant directory into
 quarantine in the same call, under the same token — physical purge ownership of an object and its
@@ -243,8 +268,9 @@ late — never touches a live file's object or its (possibly freshly-regenerated
 - Disk full mid-upload: the write fails, the temp file is not moved into place, the client sees an
   error; no partial object is left in `objects/`.
 - Two instances sharing one `dataDir`: unsupported, see above — avoid.
-- `trash/` (Stage 8.2 quarantine) is never reconciled automatically: a crash between
-  `detachForDelete` and `discardDetached` leaks a quarantined copy there permanently in this build
-  — accepted disk bloat, not a correctness issue (see "Crash semantics" above). Deliberately
-  excluded from `stack`'s backup/restore (`Snapshot` only ever captures `objects`/`variants`):
-  nothing live ever points into `trash/`, so it is disposable orphaned data, not state to preserve.
+- `trash/` (Stage 8.2 quarantine): a crash between `detachForDelete` and `discardDetached` still
+  leaks a quarantined copy there, same as always — but every maintenance pass now reconciles it
+  automatically past `TRASH_GRACE_MS` (post-production Phase 4; see "Trash reconciliation" above),
+  not a permanent leak in this build any more. Deliberately excluded from `stack`'s backup/restore
+  (`Snapshot` only ever captures `objects`/`variants`): nothing live ever points into `trash/`, so
+  it is disposable orphaned data, not state to preserve.

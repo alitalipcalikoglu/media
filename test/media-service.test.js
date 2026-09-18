@@ -116,10 +116,10 @@ test('variants are generated once and cached; delete, restore and purge remove b
     assert.throws(() => t.service.get(f.id), (e) => e instanceof MediaError && e.code === 'NOT_FOUND');
     assert.equal(t.service.restore(f.id, 'k').id, f.id);
     t.service.delete(f.id, 'k');
-    assert.deepEqual(await t.service.purge(), { files: 0, blobs: 0, tickets: 0 }, 'inside grace period');
+    assert.deepEqual(await t.service.purge(), { files: 0, blobs: 0, tickets: 0, trashReconciled: 0, trashSkipped: 0, trashErrors: 0 }, 'inside grace period');
     assert.equal(await t.storage.exists({ kind: 'object', sha256: f.sha256 }), true);
     t.clock.now += 86_400_001;
-    assert.deepEqual(await t.service.purge(), { files: 1, blobs: 1, tickets: 0 });
+    assert.deepEqual(await t.service.purge(), { files: 1, blobs: 1, tickets: 0, trashReconciled: 0, trashSkipped: 0, trashErrors: 0 });
     assert.equal(await t.storage.exists({ kind: 'object', sha256: f.sha256 }), false);
     assert.equal(await t.storage.stat(a.key), null, 'variants removed with the blob');
     assert.equal(await t.storage.exists({ kind: 'object', sha256: pdf.sha256 }), true, 'live file untouched');

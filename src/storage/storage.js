@@ -203,4 +203,23 @@ export class Storage {
   async discardDetached(token) {
     throw new Error('Storage.discardDetached must be overridden');
   }
+
+  /**
+   * Post-production Phase 4: sweeps quarantine for entries `detachForDelete` left behind because
+   * the process crashed (or otherwise never called) {@link discardDetached} for them — the
+   * accepted, harmless disk leak the Stage 8.2 crash-window tests document. Only ever inspects and
+   * removes quarantine's own namespace; never touches, lists or recurses into the canonical
+   * object/variant namespaces `detachForDelete` moved things OUT of. An entry younger than
+   * `graceMs` is left alone (still possibly mid-detach, or simply too recent to safely assume
+   * abandoned); an entry this backend cannot confidently recognise as its own quarantine format
+   * (unexpected name, a symlink, a shape mismatch) is skipped, never deleted, never followed.
+   * Bounded by `maxEntries` so one call's work is capped regardless of how large the backlog has
+   * grown; entries are considered in a deterministic order so which ones a bounded run picks is
+   * reproducible, not directory-listing-order-dependent.
+   * @param {{ graceMs: number, maxEntries: number, now?: number }} o
+   * @returns {Promise<{ reconciled: number, skipped: number, errors: number }>}
+   */
+  async reconcileTrash(o) {
+    throw new Error('Storage.reconcileTrash must be overridden');
+  }
 }

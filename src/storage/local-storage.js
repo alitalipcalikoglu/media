@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { link, mkdir, rename, rm, stat, unlink } from 'node:fs/promises';
+import { link, lstat, mkdir, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
@@ -18,6 +18,8 @@ const SHA256_RE = /^[0-9a-f]{64}$/;
 const VARIANT_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const TEMP_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** A trash entry's own filename shape — kept beside {@link TOKEN_RE} so the two patterns can't drift. */
+const TRASH_ENTRY_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(object|variants)$/;
 
 /**
  * Content-addressed object storage on the local file system, behind the {@link Storage}
@@ -222,6 +224,77 @@ export class LocalStorage extends Storage {
       rm(this.#trashPath(token, 'object'), { force: true }),
       rm(this.#trashPath(token, 'variants'), { recursive: true, force: true }),
     ]);
+  }
+
+  /**
+   * @param {{ graceMs: number, maxEntries: number, now?: number }} o
+   * @returns {Promise<{ reconciled: number, skipped: number, errors: number }>}
+   */
+  async reconcileTrash({ graceMs, maxEntries, now = Date.now() }) {
+    const trashDir = join(this.dataDir, 'trash');
+    /** @type {import('node:fs').Dirent[]} */
+    let entries;
+    try {
+      entries = await readdir(trashDir, { withFileTypes: true });
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err).code === 'ENOENT') return { reconciled: 0, skipped: 0, errors: 0 };
+      throw err;
+    }
+
+    // Group by token first (cheap: name matching only, no I/O) — an entry whose name isn't this
+    // backend's own `<token>.object`/`<token>.variants` shape is never touched, counted as skipped
+    // immediately, and never even reaches the bounded, I/O-doing part below.
+    /** @type {Map<string, { object?: import('node:fs').Dirent, variants?: import('node:fs').Dirent }>} */
+    const byToken = new Map();
+    let skipped = 0;
+    for (const entry of entries) {
+      const m = TRASH_ENTRY_RE.exec(entry.name);
+      if (!m) { skipped++; continue; }
+      const [, token, kind] = m;
+      const group = byToken.get(token) ?? {};
+      group[/** @type {'object'|'variants'} */ (kind)] = entry;
+      byToken.set(token, group);
+    }
+
+    // Deterministic order (sorted token) and a hard cap on how many tokens this call will even
+    // inspect with a syscall — a huge backlog is worked down over several runs, never all at once.
+    const tokens = [...byToken.keys()].sort();
+    const bounded = tokens.slice(0, maxEntries);
+    skipped += tokens.length - bounded.length;
+
+    let reconciled = 0;
+    let errors = 0;
+    for (const token of bounded) {
+      const group = /** @type {{ object?: import('node:fs').Dirent, variants?: import('node:fs').Dirent }} */ (byToken.get(token));
+      try {
+        const parts = /** @type {{ dirent: import('node:fs').Dirent, kind: 'object'|'variants' }[]} */ ([
+          group.object ? { dirent: group.object, kind: /** @type {const} */ ('object') } : null,
+          group.variants ? { dirent: group.variants, kind: /** @type {const} */ ('variants') } : null,
+        ].filter((p) => p !== null));
+        let eligible = true;
+        for (const part of parts) {
+          // Never follow a symlink, and never touch a token whose shape doesn't match what this
+          // backend itself would have written (a file where a directory is expected, or the
+          // reverse) — fail-safe skip, not a best-effort delete of something unrecognised.
+          if (part.dirent.isSymbolicLink() || (part.kind === 'object') !== part.dirent.isFile() || (part.kind === 'variants') !== part.dirent.isDirectory()) {
+            eligible = false;
+            break;
+          }
+          // ctime (not mtime): mtime on the object half is the ORIGINAL upload's last-write time,
+          // unrelated to when detachForDelete moved it here — ctime reflects the rename itself.
+          const st = await lstat(join(trashDir, part.dirent.name));
+          if (now - st.ctimeMs < graceMs) { eligible = false; break; }
+        }
+        if (!eligible) { skipped++; continue; }
+        // Same method the normal purge path uses — never a second delete implementation. Safe to
+        // call on a token whose `.object` or `.variants` half is already gone (force:true).
+        await this.discardDetached(token);
+        reconciled++;
+      } catch {
+        errors++;
+      }
+    }
+    return { reconciled, skipped, errors };
   }
 
   /**

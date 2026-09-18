@@ -72,6 +72,8 @@ export class Config {
     this.signedUrlTtlSec = v.signedUrlTtlSec;
     this.uploadTicketTtlSec = v.uploadTicketTtlSec;
     this.deleteGraceDays = v.deleteGraceDays;
+    this.trashGraceMs = v.trashGraceMs;
+    this.trashMaxEntries = v.trashMaxEntries;
     this.corsOrigins = v.corsOrigins;
     Object.freeze(this);
   }
@@ -137,6 +139,12 @@ export class Config {
       signedUrlTtlSec: r.integer('SIGNED_URL_TTL_SEC', 900, { min: 10, max: 604_800 }),
       uploadTicketTtlSec: r.integer('UPLOAD_TICKET_TTL_SEC', 900, { min: 30, max: 86_400 }),
       deleteGraceDays: r.integer('DELETE_GRACE_DAYS', 7, { min: 0 }),
+      // Post-production Phase 4: how long a detachForDelete()'d quarantine entry sits before
+      // trash reconciliation will remove it, and how many entries one maintenance pass will even
+      // look at — see LocalStorage#reconcileTrash. Default conservative (1 hour — a full
+      // maintenance interval of buffer); tests use a much shorter value.
+      trashGraceMs: r.integer('TRASH_GRACE_MS', 3_600_000, { min: 0 }),
+      trashMaxEntries: r.integer('TRASH_MAX_ENTRIES', 1_000, { min: 1, max: 100_000 }),
       corsOrigins,
     });
   }

@@ -38,6 +38,8 @@ import { Semaphore, SemaphoreQueueFullError, SemaphoreTimeoutError } from './sem
  * @property {number} deleteGraceMs
  * @property {number} maxConcurrentVariants   Active CPU-bound variant generations allowed at once, process-wide.
  * @property {number} variantWaitTimeoutMs    Bound on how long a NEW (non-deduped) generation waits for a free slot.
+ * @property {number} trashGraceMs    Passed straight through to `Storage#reconcileTrash`.
+ * @property {number} trashMaxEntries Passed straight through to `Storage#reconcileTrash`.
  */
 
 /**
@@ -431,7 +433,12 @@ export class MediaService {
    *    before this ran and a concurrent upload already recreated it (nothing to detach). Either
    *    way, this purge can never again touch whatever now lives at the canonical path — only
    *    `discardDetached(token)` on its own quarantine copy.
-   * @returns {Promise<{ files: number, blobs: number, tickets: number }>}
+   * 5. `storage.reconcileTrash(...)` — post-production Phase 4: sweeps quarantine for entries step
+   *    4 detached but a crash prevented step 4's own `discardDetached(token)` from ever running for
+   *    (the accepted disk leak the Stage 8.2 crash-window tests document). Runs every pass —
+   *    startup, timer and manual alike — same as every step above; never touches the canonical
+   *    namespaces, only quarantine's own.
+   * @returns {Promise<{ files: number, blobs: number, tickets: number, trashReconciled: number, trashSkipped: number, trashErrors: number }>}
    */
   async purge() {
     const now = this.now();
@@ -451,7 +458,11 @@ export class MediaService {
         this.log.error({ err, sha256 }, 'failed to purge blob bytes; DB row already deleted, bytes may need manual cleanup');
       }
     }
+    const { reconciled: trashReconciled, skipped: trashSkipped, errors: trashErrors } = await this.storage.reconcileTrash({
+      graceMs: this.options.trashGraceMs, maxEntries: this.options.trashMaxEntries, now,
+    });
+    if (trashErrors) this.log.error({ trashErrors }, 'trash reconciliation had failures; see storage-level logs/manual inspection');
     const tickets = this.tickets.purge(now);
-    return { files, blobs: confirmed.length, tickets };
+    return { files, blobs: confirmed.length, tickets, trashReconciled, trashSkipped, trashErrors };
   }
 }

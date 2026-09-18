@@ -90,6 +90,7 @@ export async function testMediaService(envOverrides = {}, deps = {}) {
       stripImageMetadata: config.stripImageMetadata, signedUrlTtlSec: config.signedUrlTtlSec, uploadTicketTtlSec: config.uploadTicketTtlSec,
       deleteGraceMs: config.deleteGraceDays * 86_400_000,
       maxConcurrentVariants: config.maxConcurrentVariants, variantWaitTimeoutMs: config.variantWaitTimeoutMs,
+      trashGraceMs: config.trashGraceMs, trashMaxEntries: config.trashMaxEntries,
     },
     now: () => clock.now,
   });

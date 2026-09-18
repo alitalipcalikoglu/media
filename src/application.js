@@ -61,6 +61,7 @@ export class Application {
         stripImageMetadata: config.stripImageMetadata, signedUrlTtlSec: config.signedUrlTtlSec, uploadTicketTtlSec: config.uploadTicketTtlSec,
         deleteGraceMs: config.deleteGraceDays * 86_400_000,
         maxConcurrentVariants: config.maxConcurrentVariants, variantWaitTimeoutMs: config.variantWaitTimeoutMs,
+        trashGraceMs: config.trashGraceMs, trashMaxEntries: config.trashMaxEntries,
       },
     });
     const app = await new MediaApi({ config, audit: this.audit, service, db: this.db, files: this.files, version: this.version }).build();
