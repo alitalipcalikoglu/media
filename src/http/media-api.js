@@ -1,9 +1,8 @@
-import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, registerInfo, registerProbes } from '@atc-web/service-core/fastify';
+import { createErrorHandler, registerInfo, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { MediaError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Cors } from './cors.js';
@@ -69,16 +68,14 @@ export class MediaApi {
     const { config } = this;
     const app = Fastify({
       ...(config.tls ? { https: { cert: readFileSync(config.tls.certPath), key: readFileSync(config.tls.keyPath), minVersion: 'TLSv1.2' } } : {}),
-      loggerInstance: this.logger,
-      logger: this.logger ? undefined : { level: config.logLevel, redact: ['req.headers.authorization'] },
+      ...requestOptions({ logger: this.logger, logLevel: config.logLevel }),
       trustProxy: config.trustProxy,
       bodyLimit: config.maxUploadBytes + 1024,
-      requestIdHeader: 'x-request-id',
-      genReqId: () => randomUUID(),
       ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
     });
     // Uploads arrive as raw bodies of any type; hand the stream through untouched.
     app.addContentTypeParser('*', (_request, payload, done) => done(null, payload));
+    registerRequestContext(app, { trustProxy: config.trustProxy });
     app.decorateRequest('apiKeyId', '');
     app.setErrorHandler(createErrorHandler(MediaError, {
       extra: (err, _request, reply) => {
