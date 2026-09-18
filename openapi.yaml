@@ -1,0 +1,901 @@
+openapi: 3.1.0
+info:
+  title: media
+  version: 1.0.0
+  description: |
+    Media service: authenticated uploads, content-addressed storage, image normalisation and
+    variants, signed URLs and range-capable delivery over HTTP.
+
+    Three distinct auth models coexist on this service:
+    - `/v1/*` (except the ticketed upload below): `Authorization: Bearer <API key>` from
+      `MEDIA_API_KEYS`. No role model — any valid key may call any `/v1/*` route; there is no
+      per-route role gate anywhere in this service.
+    - `PUT /v1/uploads/{token}`: no `Authorization` header at all. The single-use upload ticket
+      in the `{token}` path segment (minted by `POST /v1/uploads`) is the only credential.
+    - `GET /files/{id}/{variant}`: no `Authorization` header. A `public`-visibility file is
+      served to anyone; a `private`-visibility file additionally requires a valid `exp`/`sig`
+      query-string signature (HMAC-SHA256, minted by `POST /v1/files/{id}/urls` or implicitly by
+      the `urls` field on any file response). Signature verification happens inside the route
+      handler itself — it is not a securityScheme evaluated by auth middleware.
+
+    Every error response shares one envelope: `{ "error": { "code", "message", "details"? } }`.
+    `code` is a stable string (e.g. `NOT_FOUND`, `VALIDATION_FAILED`); `details`, when present, is
+    either an object (domain-specific extra fields) or an array (Ajv validation failures, one
+    entry per violated constraint: `{path, message, params}`).
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: Files
+    description: Upload, list, read, patch, delete/restore and sign URLs for stored files. API-key authenticated.
+  - name: Uploads
+    description: Single-use upload tickets that let a browser upload directly, without an API key.
+  - name: Delivery
+    description: Public or signature-gated byte delivery, with conditional and range-request support.
+  - name: Operations
+    description: Liveness/readiness/info/metrics, uniform across every atc-web service.
+paths:
+  /health:
+    get:
+      operationId: media.ops.health
+      tags: [Operations]
+      summary: Liveness probe
+      description: Always `200`. Performs no dependency check — see `GET /ready` for that.
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+
+  /ready:
+    get:
+      operationId: media.ops.ready
+      tags: [Operations]
+      summary: Readiness probe
+      description: |
+        Runs the real dependency check (DB ping + storage layout check), cached for 30 seconds
+        between calls (`MediaApi.READY_CACHE_MS`).
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Dependencies are healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, enum: [ok] }
+        '503':
+          description: A dependency check failed (cached result up to 30s old).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, error]
+                properties:
+                  status: { type: string, enum: [unavailable] }
+                  error: { type: string, description: The caught error's message. }
+
+  /v1/info:
+    get:
+      operationId: media.ops.info
+      tags: [Operations]
+      summary: Service and API contract identification
+      security: []
+      x-stack-visibility: public
+      responses:
+        '200':
+          description: Static, per-instance service metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, version, apiVersion, capabilities, schemaVersion, serviceCore]
+                properties:
+                  service: { type: string, enum: [media] }
+                  version: { type: string, description: This service's own package.json semver. }
+                  apiVersion: { type: string, enum: [v1] }
+                  capabilities:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      Static list, always `["content-dedup", "signed-urls", "ticketed-uploads",
+                      "soft-delete", "variants"]` for this service — no config flag makes any of
+                      these instance-variable.
+                    example: [content-dedup, signed-urls, ticketed-uploads, soft-delete, variants]
+                  schemaVersion: { type: integer, description: "SQLite `PRAGMA user_version` of the open database." }
+                  serviceCore: { type: string, description: Installed `@atc-web/service-core` version actually running. }
+
+  /v1/files:
+    put:
+      operationId: media.files.upload
+      tags: [Files]
+      summary: Upload a file
+      description: |
+        Raw-body upload — **not** `multipart/form-data**; no multipart dependency exists in this
+        service. The request body is the file's bytes verbatim, piped straight into storage
+        without buffering the whole thing in memory.
+
+        The real type is sniffed from the leading bytes server-side (`TypeSniffer`); any
+        client-supplied `Content-Type` is ignored for storage/serving decisions. Raster images
+        (`image/jpeg`, `png`, `webp`, `gif`, `avif`) are re-encoded on upload by default
+        (`STRIP_IMAGE_METADATA=true`), which strips EXIF/GPS/XMP/ICC metadata (ICC profile is
+        re-embedded) and defeats polyglot files; `application/pdf` and, if enabled via
+        `ALLOWED_TYPES`, `image/svg+xml` are stored as-is.
+
+        Filename: the `name` query parameter wins; if absent, the `X-File-Name` header is used
+        (URL-decoded if possible); if both are absent, a generic `file.<ext>` name is generated.
+        Either way the name is sanitised and its extension is always re-derived from the sniffed
+        type, never trusted from the client.
+
+        **Maximum upload size**: `MAX_UPLOAD_BYTES` (default 25 MiB), enforced inside the storage
+        layer's write-stream as bytes arrive. Fastify's own `bodyLimit` config on this app
+        (`maxUploadBytes + 1024`) is set but is dead code for this route: its enforcement only
+        applies to parsers registered with `parseAs: 'string'|'buffer'`, and this route's raw
+        passthrough content-type parser bypasses that check entirely. The byte cap above is real
+        and enforced — just not by the mechanism the Fastify config implies.
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/UploadVisibility'
+        - $ref: '#/components/parameters/UploadName'
+        - $ref: '#/components/parameters/XFileName'
+      requestBody:
+        required: true
+        content:
+          '*/*':
+            schema:
+              type: string
+              format: binary
+              description: Raw file bytes. Any Content-Type is accepted; the real type is sniffed server-side.
+      responses:
+        '201':
+          description: File stored (or deduplicated against existing identical content).
+          headers:
+            Location:
+              schema: { type: string }
+              description: "`/v1/files/{id}` of the stored file."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/FileView' }
+        '400':
+          description: |
+            `VALIDATION_FAILED` (malformed `visibility`/`name` query parameter) — or, from the
+            upload stream itself: `EMPTY` (zero-byte body) or `STREAM_ERROR` (the request stream
+            errored or was aborted partway through).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/TooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedType'
+        '422':
+          $ref: '#/components/responses/InvalidImage'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    get:
+      operationId: media.files.list
+      tags: [Files]
+      summary: List files owned by the calling API key
+      description: |
+        Keyset pagination, newest first. `nextCursor` is an opaque, base64url-encoded
+        `<createdAt>:<id>` token; pass it back as `cursor` to fetch the next page. `null` means no
+        further pages.
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: "Page size, 1-100. Default 20."
+          schema: { type: string, pattern: '^([1-9]|[1-9][0-9]|100)$' }
+        - name: cursor
+          in: query
+          required: false
+          description: Opaque `nextCursor` value from a previous page.
+          schema: { type: string, maxLength: 128 }
+      responses:
+        '200':
+          description: A page of files owned by the calling key.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FileList' }
+        '400':
+          description: |
+            `VALIDATION_FAILED` (malformed `limit`/`cursor`) or `INVALID_ARGUMENT` (`cursor`
+            passed schema validation but does not decode to a well-formed keyset cursor).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/files/{id}:
+    get:
+      operationId: media.files.get
+      tags: [Files]
+      summary: Get a file's metadata
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '200':
+          description: The file, scoped to the calling API key.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/FileView' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: "`NOT_FOUND` — file does not exist, is soft-deleted, or is owned by a different API key."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    patch:
+      operationId: media.files.patch
+      tags: [Files]
+      summary: Update a file's visibility and/or name
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FilePatchBody' }
+      responses:
+        '200':
+          description: The updated file.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/FileView' }
+        '400':
+          description: "`VALIDATION_FAILED` — empty body, or a `visibility`/`name` value outside its allowed shape."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: "`NOT_FOUND` — file does not exist, is soft-deleted, or is owned by a different API key."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+    delete:
+      operationId: media.files.delete
+      tags: [Files]
+      summary: Soft-delete a file
+      description: |
+        Marks the file deleted; it stops appearing in `GET /v1/files`/`GET /v1/files/{id}` and its
+        delivery route immediately. Bytes are only physically purged after `DELETE_GRACE_DAYS`
+        (default 7). Reversible within that window via `POST /v1/files/{id}/restore`.
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '204':
+          description: Soft-deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: "`NOT_FOUND` — file does not exist, is already soft-deleted, or is owned by a different API key."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/files/{id}/restore:
+    post:
+      operationId: media.files.restore
+      tags: [Files]
+      summary: Undo a soft delete
+      description: Only works within the `DELETE_GRACE_DAYS` grace window, before bytes are physically purged.
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+      responses:
+        '200':
+          description: The restored file.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/FileView' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: "`NOT_FOUND` — file does not exist or is owned by a different API key (restorable regardless of current soft-delete state, as long as both are true)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/files/{id}/urls:
+    post:
+      operationId: media.files.signUrls
+      tags: [Files]
+      summary: (Re-)sign delivery URLs for a file
+      description: |
+        Returns a fresh `urls` map (same shape as `FileView.urls`) with a caller-chosen TTL. For a
+        `public` file every URL is unsigned and `expiresAt` is always `null`, regardless of `ttl`.
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      parameters:
+        - $ref: '#/components/parameters/FileId'
+        - name: ttl
+          in: query
+          required: false
+          description: |
+            Signature lifetime in seconds. Digits only; server-side clamped to a maximum of
+            604800 (7 days) even if a larger value is supplied. Defaults to `SIGNED_URL_TTL_SEC`
+            (service default 900s) when omitted.
+          schema: { type: string, pattern: '^\d{1,7}$' }
+      responses:
+        '200':
+          description: Freshly signed URLs for this file.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [urls]
+                properties:
+                  urls: { $ref: '#/components/schemas/UrlsMap' }
+        '400':
+          description: "`VALIDATION_FAILED` — malformed `ttl`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: "`NOT_FOUND` — file does not exist, is soft-deleted, or is owned by a different API key."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/uploads:
+    post:
+      operationId: media.tickets.create
+      tags: [Uploads]
+      summary: Issue a single-use upload ticket
+      description: |
+        Lets a browser (or any caller without an API key) upload one file directly to
+        `PUT /v1/uploads/{token}`. The ticket is consumed exactly once, on the first successful or
+        failed upload attempt against it (a failed attempt releases it for retry); it always
+        expires after `UPLOAD_TICKET_TTL_SEC` (default 900s) regardless of use.
+
+        Note: the plaintext ticket token is forwarded, unhashed, into this action's own audit
+        event (`target.id`) — unlike every other credential in this service (API keys, and the
+        ticket token itself in normal use), which is only ever stored or forwarded as a hash. The
+        ticket's short lifetime and single use bound the exposure, but this is a real, confirmed
+        inconsistency with the rest of the platform's credential-handling discipline.
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: authenticated
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TicketCreateBody' }
+      responses:
+        '201':
+          description: Ticket issued.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadTicket' }
+        '400':
+          description: |
+            `VALIDATION_FAILED` (malformed body) or `INVALID_ARGUMENT` (`maxBytes` outside
+            `1..MAX_UPLOAD_BYTES`, or `allowedTypes` includes a type this service does not itself
+            allow via `ALLOWED_TYPES`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/uploads/{token}:
+    put:
+      operationId: media.files.uploadTicketed
+      tags: [Uploads]
+      summary: Upload against a single-use ticket
+      description: |
+        Ticket-only auth: **no `Authorization` header is sent or checked on this route at all** —
+        the `{token}` path segment is the sole credential, matched against the hash of a live,
+        unused, unexpired ticket from `POST /v1/uploads`. Designed to be called directly from a
+        browser (see the `Cors` allow-list for this route's CORS behaviour).
+
+        Same raw-body semantics as `PUT /v1/files` (not `multipart/form-data`) and the same
+        server-side type sniffing, default image re-encoding/metadata stripping, and filename
+        resolution (`name` query parameter, else `X-File-Name` header, else generated). Visibility
+        and the upload's own byte/type limits come from the ticket itself (set when it was
+        created), not from this request.
+
+        On any failure the ticket is released (not burned), so the client may retry against the
+        same `{token}` until it expires.
+      security: []
+      x-stack-visibility: public
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Single-use upload ticket, exactly as returned by `POST /v1/uploads`.
+          schema: { type: string, pattern: '^[A-Za-z0-9_-]{43}$' }
+        - $ref: '#/components/parameters/UploadName'
+        - $ref: '#/components/parameters/XFileName'
+      requestBody:
+        required: true
+        content:
+          '*/*':
+            schema:
+              type: string
+              format: binary
+              description: Raw file bytes. Any Content-Type is accepted; the real type is sniffed server-side.
+      responses:
+        '201':
+          description: File stored (or deduplicated against existing identical content).
+          headers:
+            Location:
+              schema: { type: string }
+              description: "`/v1/files/{id}` of the stored file."
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [file]
+                properties:
+                  file: { $ref: '#/components/schemas/FileView' }
+        '400':
+          description: |
+            `VALIDATION_FAILED` (malformed `name` query parameter) — or, from the upload stream
+            itself: `EMPTY` (zero-byte body) or `STREAM_ERROR` (the request stream errored or was
+            aborted partway through).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          description: "`INVALID_TICKET` — the ticket is unknown, already used, or expired. Distinct from the API-key `UNAUTHORIZED` used elsewhere: this route never checks `Authorization`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '413':
+          description: |
+            `TOO_LARGE` — upload exceeds the ticket's own `maxBytes` (which can be tighter than,
+            but never looser than, the service-wide `MAX_UPLOAD_BYTES`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '415':
+          $ref: '#/components/responses/UnsupportedType'
+        '422':
+          $ref: '#/components/responses/InvalidImage'
+
+  /files/{id}/{variant}:
+    get:
+      operationId: media.files.deliver
+      tags: [Delivery]
+      summary: Deliver a file's original bytes or an image variant
+      description: |
+        Unauthenticated: no `Authorization` header is checked. Gating is visibility-dependent and
+        happens inside the handler, not via any securityScheme:
+        - `visibility: "public"` files: always served, to anyone.
+        - `visibility: "private"` files: served only with a valid `exp`+`sig` query-string
+          signature (HMAC-SHA256 over `fileId\nvariant\nexpiresAtSec`, minted by
+          `POST /v1/files/{id}/urls` or a file's own `urls` field); otherwise `403 FORBIDDEN`.
+
+        `{variant}` is either the literal `original` or a configured preset name (default
+        `thumb`, `small`, `medium`, `large` — see `VARIANTS`/`Config.DEFAULT_VARIANTS`; this is
+        operator-configurable per deployment, not a fixed contract). A non-`original` variant is
+        generated lazily on first request for a given (file, variant) pair — that first response
+        pays image-encode latency synchronously; later requests are served from a disk cache.
+        Variants exist only for raster images (`image/jpeg`, `png`, `webp`, `gif`, `avif`) and are
+        always re-encoded as `image/webp` regardless of the original format; `original` always
+        preserves the file's sniffed upload type.
+
+        Concurrency: generation is bounded by a process-wide semaphore
+        (`MAX_CONCURRENT_VARIANTS`, default 4); a request that cannot get a slot within
+        `VARIANT_WAIT_TIMEOUT_MS` (default 30s) gets `503 VARIANT_BUSY`. Concurrent requests for
+        the *same* (file, variant) share one generation and never contend for more than one slot
+        between them.
+
+        Range requests: single-range only (`Range: bytes=start-end`, `bytes=start-`, or
+        `bytes=-suffix`). A **multi-range** `Range` header is silently treated as absent — served
+        as a full `200`, not rejected. `If-None-Match` is honoured against a strong ETag
+        (derived from the file's sha256 and the variant name) for conditional `304` responses.
+      security: []
+      x-stack-visibility: public
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/FileId' }
+        - name: variant
+          in: path
+          required: true
+          description: "`original`, or a configured variant preset name."
+          schema: { type: string, pattern: '^[a-z][a-z0-9-]{0,31}$' }
+        - name: exp
+          in: query
+          required: false
+          description: |
+            Signature expiry, Unix seconds. Required (together with `sig`) only to read a
+            `private` file; ignored for a `public` file. Not a securityScheme — verified inside
+            the handler, not by auth middleware.
+          schema: { type: string, pattern: '^\d{1,12}$' }
+        - name: sig
+          in: query
+          required: false
+          description: base64url HMAC-SHA256 signature. Required (together with `exp`) only to read a `private` file; ignored for a `public` file.
+          schema: { type: string, maxLength: 64 }
+        - name: download
+          in: query
+          required: false
+          description: |
+            When `1`, adds an `X-Media-Force-Download: 1` response header. Note this header is
+            informational only: it does **not** itself change `Content-Disposition`, which is
+            always derived solely from whether the delivered MIME type is an image (`inline`) or
+            not (`attachment`) — confirmed from source, not a design assumption.
+          schema: { type: string, enum: ['1'] }
+        - name: Range
+          in: header
+          required: false
+          description: Single-range only; see the operation description.
+          schema: { type: string, example: 'bytes=0-1023' }
+        - name: If-None-Match
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Full content.
+          headers:
+            ETag: { schema: { type: string } }
+            Accept-Ranges: { schema: { type: string, enum: [bytes] } }
+            Cache-Control: { schema: { type: string }, description: "`public, max-age=31536000, immutable` for a public file; `private, max-age=0, no-store` for a private one." }
+            Content-Type: { schema: { type: string } }
+            Content-Disposition: { schema: { type: string }, description: "`inline` for images, `attachment` otherwise, both with an RFC 6266 filename." }
+            Content-Security-Policy: { schema: { type: string, enum: ["default-src 'none'; sandbox"] } }
+            X-Frame-Options: { schema: { type: string, enum: [DENY] }, description: Present only when the response is not an image (non-inline).
+            }
+            X-Content-Type-Options: { schema: { type: string, enum: [nosniff] } }
+            Content-Length: { schema: { type: string } }
+            X-Media-Force-Download: { schema: { type: string, enum: ['1'] }, description: "Present only when `?download=1` was given. See the `download` parameter's description." }
+          content:
+            image/*:
+              schema: { type: string, format: binary }
+            application/pdf:
+              schema: { type: string, format: binary }
+        '206':
+          description: Partial content for a satisfiable single-range request.
+          headers:
+            Content-Range: { schema: { type: string, example: 'bytes 0-1023/50000' } }
+            Content-Length: { schema: { type: string } }
+            ETag: { schema: { type: string } }
+            Accept-Ranges: { schema: { type: string, enum: [bytes] } }
+          content:
+            image/*:
+              schema: { type: string, format: binary }
+            application/pdf:
+              schema: { type: string, format: binary }
+        '304':
+          description: "`If-None-Match` matched the current ETag. Same caching/type headers as `200`, empty body."
+        '400':
+          description: "`VALIDATION_FAILED` (malformed `exp`/`sig`/`download`) or `NOT_AN_IMAGE` (a variant other than `original` was requested for a non-raster file)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '403':
+          description: "`FORBIDDEN` — the file is `private` and `exp`/`sig` are missing or do not verify."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '404':
+          description: "`NOT_FOUND` (file does not exist or is soft-deleted) or `UNKNOWN_VARIANT` (`{variant}` is not `original` and not a configured preset name)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '416':
+          description: Range request outside the resource's size, or a zero-length suffix range.
+          headers:
+            Content-Range: { schema: { type: string, example: 'bytes */50000' } }
+        '503':
+          description: "`VARIANT_BUSY` — no generation slot became free within `VARIANT_WAIT_TIMEOUT_MS`; retry shortly."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /metrics:
+    get:
+      operationId: media.ops.metrics
+      tags: [Operations]
+      summary: Prometheus text-format metrics
+      description: |
+        Authenticated like any other `/v1/*`-style route (same `Authorization: Bearer <API key>`),
+        but registered outside `/v1` and, uniformly across this platform, exempt from this
+        service's own rate limiter (a Prometheus scraper hits it on a fixed schedule; rate
+        limiting it would be actively harmful).
+      security:
+        - ApiKeyAuth: []
+      x-stack-visibility: operational
+      responses:
+        '200':
+          description: Prometheus exposition format.
+          content:
+            text/plain; version=0.0.4; charset=utf-8:
+              schema:
+                type: string
+                example: |
+                  # HELP media_files Live files.
+                  # TYPE media_files gauge
+                  media_files 42
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <secret>`. Keys come from `MEDIA_API_KEYS` (`id:secret` pairs; this
+        service has no role model — any valid key may call any `/v1/*` route). Every configured
+        key is compared in constant time (SHA-256 + `timingSafeEqual`, no early exit), so timing
+        cannot reveal whether, or which, key matched.
+
+  parameters:
+    FileId:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/FileId' }
+    UploadVisibility:
+      name: visibility
+      in: query
+      required: false
+      description: Defaults to `private` when omitted.
+      schema: { $ref: '#/components/schemas/Visibility' }
+    UploadName:
+      name: name
+      in: query
+      required: false
+      description: |
+        Display filename, 1-255 characters. Takes precedence over the `X-File-Name` header when
+        both are given. Sanitised server-side and its extension is always re-derived from the
+        sniffed type; a generic `file.<ext>` name is used if neither `name` nor `X-File-Name` is
+        given.
+      schema: { $ref: '#/components/schemas/FileName' }
+    XFileName:
+      name: X-File-Name
+      in: header
+      required: false
+      description: |
+        Fallback filename source, used only when the `name` query parameter is absent.
+        URL-decoded if possible, used raw otherwise.
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: "`UNAUTHORIZED` — missing or non-matching `Authorization: Bearer` API key."
+      headers:
+        WWW-Authenticate:
+          schema: { type: string, enum: [Bearer] }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    TooLarge:
+      description: |
+        `TOO_LARGE` — upload exceeds `MAX_UPLOAD_BYTES` (service default 25 MiB). Enforced inside
+        the storage layer's write-stream as bytes arrive, not by Fastify's `bodyLimit` config
+        (which is set but inert for this raw-passthrough route).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    UnsupportedType:
+      description: "`UNSUPPORTED_TYPE` — the sniffed type (from the file's real leading bytes, never the client-supplied `Content-Type`) is unrecognised or not in `ALLOWED_TYPES`."
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    InvalidImage:
+      description: "`INVALID_IMAGE` — the sniffed type is a raster image format, but the bytes fail to decode, have no dimensions, or exceed `MAX_IMAGE_PIXELS` (decompression-bomb guard)."
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+    RateLimited:
+      description: |
+        `RATE_LIMITED` — this API key exceeded `RATE_LIMIT_MAX` requests/minute
+        (service default 600) against `/v1/*`. Not applicable to `PUT /v1/uploads/{token}`,
+        `GET /files/{id}/{variant}` or `GET /metrics`, none of which sit behind this limiter.
+      headers:
+        X-RateLimit-Limit: { schema: { type: string } }
+        X-RateLimit-Remaining: { schema: { type: string } }
+        X-RateLimit-Reset: { schema: { type: string } }
+        Retry-After: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, description: "Stable machine-readable code, e.g. `NOT_FOUND`, `VALIDATION_FAILED`." }
+            message: { type: string }
+            details:
+              description: |
+                Present only for some codes: an object of domain-specific extra fields (e.g.
+                `{maxBytes}` on `TOO_LARGE`), or, for `VALIDATION_FAILED`, an array of
+                `{path, message, params}` — one entry per violated Ajv constraint.
+
+    FileId:
+      type: string
+      format: uuid
+
+    Visibility:
+      type: string
+      enum: [public, private]
+
+    FileName:
+      type: string
+      minLength: 1
+      maxLength: 255
+
+    SignedUrl:
+      type: object
+      required: [url, expiresAt]
+      properties:
+        url: { type: string, format: uri }
+        expiresAt:
+          type: [string, 'null']
+          format: date-time
+          description: "`null` for a `public` file's URL (unsigned, never expires); an ISO-8601 timestamp for a `private` file's signed URL."
+
+    UrlsMap:
+      type: object
+      description: |
+        Always has `original`. Also has one entry per configured image-variant preset, but only
+        when the file is a raster image — non-raster files (`application/pdf`, `image/svg+xml`)
+        have `original` only. The variant preset names below (`thumb`, `small`, `medium`, `large`)
+        are this service's *default* `VARIANTS` configuration
+        (`Config.DEFAULT_VARIANTS`) — an operator may configure different names/sizes, so this is
+        illustrative, not a fixed contract guarantee.
+      required: [original]
+      properties:
+        original: { $ref: '#/components/schemas/SignedUrl' }
+        thumb: { $ref: '#/components/schemas/SignedUrl' }
+        small: { $ref: '#/components/schemas/SignedUrl' }
+        medium: { $ref: '#/components/schemas/SignedUrl' }
+        large: { $ref: '#/components/schemas/SignedUrl' }
+      additionalProperties:
+        $ref: '#/components/schemas/SignedUrl'
+
+    FileView:
+      type: object
+      required: [id, name, mime, size, width, height, sha256, visibility, createdAt, urls]
+      properties:
+        id: { $ref: '#/components/schemas/FileId' }
+        name: { type: string, description: Sanitised display name; extension always matches the sniffed type. }
+        mime: { type: string, description: Server-sniffed MIME type of the `original` — never the client-supplied `Content-Type`. }
+        size: { type: integer, minimum: 0, description: Byte size of the `original`. }
+        width:
+          type: [integer, 'null']
+          description: Pixel width. `null` for a non-raster file (`application/pdf`, `image/svg+xml`); always set for a raster image.
+        height:
+          type: [integer, 'null']
+          description: Pixel height. `null` for a non-raster file; always set for a raster image.
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: "Content hash of the `original`'s bytes (after metadata-stripping normalisation, when applied). Drives content-addressed dedup." }
+        visibility: { $ref: '#/components/schemas/Visibility' }
+        createdAt: { type: string, format: date-time }
+        urls: { $ref: '#/components/schemas/UrlsMap' }
+
+    FileList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/FileView' }
+        nextCursor:
+          type: [string, 'null']
+          description: Opaque keyset cursor for the next page, or `null` when this is the last page.
+
+    FilePatchBody:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        visibility: { $ref: '#/components/schemas/Visibility' }
+        name: { $ref: '#/components/schemas/FileName' }
+
+    TicketCreateBody:
+      type: object
+      additionalProperties: false
+      properties:
+        visibility:
+          allOf: [{ $ref: '#/components/schemas/Visibility' }]
+          description: Defaults to `private` when omitted.
+        maxBytes:
+          type: integer
+          minimum: 1
+          description: "Tighter cap than the service-wide `MAX_UPLOAD_BYTES`, which is the absolute ceiling regardless of this value. Defaults to `MAX_UPLOAD_BYTES` when omitted."
+        allowedTypes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          uniqueItems: true
+          items: { type: string, pattern: '^[a-z]+/[a-z0-9.+-]+$' }
+          description: Subset of this service's own `ALLOWED_TYPES`. Defaults to the full `ALLOWED_TYPES` list when omitted.
+        name:
+          allOf: [{ $ref: '#/components/schemas/FileName' }]
+          description: Pre-set display filename for the eventual upload; overridable by the browser's own `name`/`X-File-Name` at upload time.
+
+    UploadTicket:
+      type: object
+      required: [token, uploadUrl, expiresAt, maxBytes, allowedTypes, method]
+      properties:
+        token:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{43}$'
+          description: Single-use credential; also the `{token}` path segment for `PUT /v1/uploads/{token}`.
+        uploadUrl: { type: string, format: uri, description: "Fully-qualified `PUT` target, i.e. `{PUBLIC_BASE_URL}/v1/uploads/{token}`." }
+        expiresAt: { type: string, format: date-time }
+        maxBytes: { type: integer, minimum: 1 }
+        allowedTypes:
+          type: array
+          items: { type: string }
+        method: { type: string, enum: [PUT] }
