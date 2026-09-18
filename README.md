@@ -176,7 +176,7 @@ With `AUDIT_URL` and `AUDIT_API_KEY` set, every completed write request is forwa
 
 ## Scaling model
 
-Single-node stateful: one process owns the SQLite file and the local object-storage directory.
+**B — single-node stateful.** One process owns the SQLite file and the local object-storage directory.
 Deferred variant generation de-duplicates concurrent requests for the same variant only within one
 process — two instances asked for the same missing variant would both encode it (wasted work, not
 corruption). Two instances sharing one data directory are not supported.
