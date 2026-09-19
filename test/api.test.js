@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { after, before, test } from 'node:test';
 import sharp from 'sharp';
 import { readServiceVersion } from '@atc-web/service-core/fastify';
@@ -26,6 +27,9 @@ after(async () => { await app.close(); t.cleanup(); });
 test('probes are public; /v1 and /metrics need an API key', async () => {
   assert.equal((await app.inject('/health')).statusCode, 200);
   assert.equal((await app.inject('/ready')).statusCode, 200);
+  const spec = await app.inject('/openapi.yaml');
+  assert.equal(spec.body, readFileSync(new URL('../openapi.yaml', import.meta.url), 'utf8'));
+  assert.match(String(spec.headers['content-type']), /^text\/yaml/);
   for (const url of ['/v1/files', '/metrics']) {
     const res = await app.inject({ url });
     assert.equal(res.statusCode, 401, url);

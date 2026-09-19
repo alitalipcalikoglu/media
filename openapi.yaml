@@ -34,6 +34,19 @@ tags:
   - name: Operations
     description: Liveness/readiness/info/metrics, uniform across every atc-web service.
 paths:
+  /openapi.yaml:
+    get:
+      operationId: media.openapi
+      summary: Download the canonical OpenAPI document
+      description: Returns this service's repository-root OpenAPI 3.1 document byte-for-byte.
+      security: []
+      responses:
+        "200":
+          description: Canonical OpenAPI document.
+          content:
+            text/yaml:
+              schema: { type: string }
+
   /health:
     get:
       operationId: media.ops.health

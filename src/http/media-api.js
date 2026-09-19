@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import rateLimit from '@fastify/rate-limit';
 import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
-import { createErrorHandler, registerInfo, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
+import { createErrorHandler, registerInfo, registerOpenApi, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { MediaError } from '../domain/errors.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Cors } from './cors.js';
@@ -92,6 +92,7 @@ export class MediaApi {
       this.db.ping();
       await this.service.storage.check();
     }, { cacheMs: MediaApi.READY_CACHE_MS });
+    registerOpenApi(app, new URL('../../openapi.yaml', import.meta.url));
     registerInfo(app, {
       service: 'media',
       version: this.version,
