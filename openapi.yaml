@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: media
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Media service: authenticated uploads, content-addressed storage, image normalisation and
     variants, signed URLs and range-capable delivery over HTTP.
