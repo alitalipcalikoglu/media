@@ -6,7 +6,8 @@ import { readServiceVersion } from '@atc-web/service-core/fastify';
 import { MediaApi } from '../src/http/media-api.js';
 import { API_KEY, OTHER_KEY, silentLog, testImage, testMediaService } from './helpers.js';
 
-const VERSION = readServiceVersion(import.meta.url);
+const RUNTIME_VERSION = readServiceVersion(import.meta.url);
+const PACKAGE_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 /** @type {Awaited<ReturnType<typeof testMediaService>>} */
 let t;
@@ -19,7 +20,7 @@ const call = (method, url, { payload, headers = {} } = {}) => app.inject({ metho
 
 before(async () => {
   t = await testMediaService({ CORS_ORIGINS: 'https://app.test.local', RATE_LIMIT_MAX: '500' });
-  app = await new MediaApi({ config: t.config, service: t.service, db: t.db, files: t.files, logger: silentLog, version: VERSION }).build();
+  app = await new MediaApi({ config: t.config, service: t.service, db: t.db, files: t.files, logger: silentLog, version: RUNTIME_VERSION }).build();
   await app.ready();
 });
 after(async () => { await app.close(); t.cleanup(); });
@@ -42,7 +43,7 @@ test('GET /v1/info reports service identity and current capabilities', async () 
   assert.equal(res.statusCode, 200);
   const body = res.json();
   assert.equal(body.service, 'media');
-  assert.equal(body.version, VERSION);
+  assert.equal(body.version, PACKAGE_VERSION);
   assert.equal(body.apiVersion, 'v1');
   assert.deepEqual(body.capabilities, ['content-dedup', 'signed-urls', 'ticketed-uploads', 'soft-delete', 'variants']);
   assert.equal(typeof body.schemaVersion, 'number');
