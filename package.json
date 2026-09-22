@@ -1,6 +1,6 @@
 {
   "name": "@atc-web/media",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "description": "Media service: authenticated uploads, content-addressed storage, image normalisation and variants, signed URLs and range-capable delivery over HTTP",
   "license": "MIT",
