@@ -4,6 +4,7 @@ import Fastify from 'fastify';
 import { AuditClient } from '@atc-web/service-core/audit';
 import { createErrorHandler, registerInfo, registerOpenApi, registerProbes, registerRequestContext, requestOptions } from '@atc-web/service-core/fastify';
 import { MediaError } from '../domain/errors.js';
+import { TicketStore } from '../store/ticket-store.js';
 import { ApiKeyAuth } from './api-key-auth.js';
 import { Cors } from './cors.js';
 import { FileServer } from './file-server.js';
@@ -226,7 +227,7 @@ export class MediaApi {
       return { urls: s.urls(f, ttl) };
     });
 
-    api.post('/uploads', { config: { audit: AuditClient.route('media.upload.ticket', (_r, b) => ({ type: 'ticket', id: b.token })) },  schema: { body: Schemas.ticketBody } }, async (request, reply) => {
+    api.post('/uploads', { config: { audit: AuditClient.route('media.upload.ticket', (_r, b) => ({ type: 'ticket', id: TicketStore.hash(b.token) })) },  schema: { body: Schemas.ticketBody } }, async (request, reply) => {
       const body = /** @type {any} */ (request.body ?? {});
       const t = s.createTicket({ apiKeyId: request.apiKeyId, ...body });
       return reply.code(201).send({ ...t, expiresAt: new Date(t.expiresAt).toISOString(), method: 'PUT' });

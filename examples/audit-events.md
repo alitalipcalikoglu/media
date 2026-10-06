@@ -21,6 +21,8 @@ One event per completed write request, `outcome: "success"` for 2xx, `outcome: "
 | `media.file.restore` | `POST /v1/files/:id/restore` |
 | `media.upload.ticket` | `POST /v1/uploads` |
 
+For `media.upload.ticket` the target is `{ type: "ticket", id: <sha256 hex of the token> }`, the same hash the ticket is stored under. The plaintext token is never forwarded.
+
 ## Event shape
 
 ```json
